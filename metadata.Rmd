@@ -1,0 +1,749 @@
+---
+title: "metadata"
+author: "Jules Baldous"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    fig_width: 10
+    fig_height: 10
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = F, error = TRUE)
+rm(list = ls())
+```
+
+Alt + O pour replier tout et ouvrir que ce qui est pertinent.
+
+**Package nécessaires à l'exécution de ce document :**
+
+```{r package}
+library(dplyr)
+library(gtsummary)
+library(GGally)
+library(ggplot2)
+library(FactoMineR)
+library(factoextra)
+library(plotly)
+library(corrplot)
+library(scales)
+library(psych)
+library(pheatmap)
+library(pvclust)
+library(ggpmisc)
+library(ggbeeswarm)
+library(MASS)
+library(car)
+library(tidyr)
+library(gridExtra)
+```
+
+
+# Importation des métadonnées
+
+```{r importation_1}
+metadata_complete <-read.csv("~/Documents/recherche/Stage_M1/eve/data/metadata.csv")
+```
+
+# Traitement des métadonnées
+
+## Dataframe `metadata`
+
+On crée un premier jeu de données : `metadata` qui regroupe toutes les informations utiles indépendantes du suivi (donc on ne prend pas en compte les traitements antibiotiques et les voyages, qu'on prendra en compte dans deux jeux de données autres). Ce jeu est donc indépendant du temps et on fait l'hypothèse que chaque variable ne change pas avec le temps pendant la cohorte.
+
+```{r traitement_1}
+# Exclure les patients qui n'ont pas terminé la cohorte ainsi que les informations des visites de suivi et toutes les colonnes inutiles (modifier les index en si le df change)
+to_exclude <- c(11, 18, 25, 41)
+
+metadata <- metadata_complete %>%
+  filter(!record_id %in% to_exclude, redcap_event_name == "visite_dinclusion_arm_1") %>% # On enlève les patients n'ayant pas finis la cohore et les informations des visites de suivi
+  dplyr::select(-c(2:7, 9:29, 37:43, 66, 78:185)) %>% # On sélectionne uniquement les colonnes d'intérêt
+  mutate(age = as.numeric(substr(metadata_complete[!metadata_complete$record_id %in% to_exclude &
+                    metadata_complete$redcap_event_name == "visite_dinclusion_arm_1", "rfstdtc"],1, 4)) - metadata_complete[!metadata_complete$record_id %in% to_exclude & metadata_complete$redcap_event_name=="visite_dinclusion_arm_1", "brthyy"]) %>% # On transforme les dates de naissance en âge 
+  dplyr::select(1:2, 43, everything()) # On met l'âge en troisième position 
+
+#On transforme certaines colonnes en facteurs qui sont des numériques, à tort
+metadata$code_postal <- as.factor(metadata$code_postal)
+```
+
+On va calculer le score EPICES (voir [https://www.nouvelle-aquitaine.ars.sante.fr/system/files/201902/ETP_07_02_2019_Score_EPICES.pdf](ici){.uri}) pour la précarité. Un haut score correspond à plus de précarité. Au dessus de 30 une personne est considérée précaire.
+
+```{r epices}
+# Le score EPICES est une combinaison linéaire des réponses au questionnaire de précarité
+metadata <- metadata %>%
+  mutate(score_epices = 75.14 +
+           10.06 * (travailleur_social == 1) -
+           11.83 * (type_mutuelle %in% c(1, 2)) -
+           8.28 * (couple == 1) -
+           8.28 * (proprietaire == 1) +
+           14.8 * (difficultes_financieres == 1) -
+           6.51 * (sport == 1) -
+           7.1 * (spectacle == 1) -
+           7.1 * (vacances == 1) -
+           9.47 * (contacts_famille == 1) -
+           (9.47 + 7.1) * (aide == 1))
+```
+
+Ainsi, chaque ligne de `metadata` représente un individu avec ses différentes caractéristiques en colonne.
+
+Nous allons visualiser rapidement le dataframe `metadata`. Commençons par les caractéristiques quantitatives de chaque hôtes.
+
+```{r visualisation_metadata_1}
+#Pour obtenir des indicateurs d'étalements et de position intéressants.
+theme_gtsummary_mean_sd()
+
+metadata %>% tbl_summary(include = c(age, taille_cm, poids, score_epices))
+```
+
+La moyenne d'âge de la cohorte est de 32 ans. La taille moyenne des individus est de 171 cm et le poids moyen est de 69 kg. On voit aussi qu'en moyenne nos hôtes sont en dessous du seuil de précarité.
+
+Nous allons représenter la distribution des variables quantitatives citées plus haut.
+
+```{r visualisation_metadata_2}
+# Distribution age
+plot_distrib_age <- ggplot(metadata, aes(x = age)) + 
+  geom_histogram(binwidth = 10) +
+  theme_bw() + xlab("Age") + ylab("Count")
+
+# Distribution taille
+plot_distrib_taille <- ggplot(metadata, aes(x = taille_cm)) + 
+  geom_histogram(binwidth = 5) +
+  theme_bw() + xlab("Taille (cm)") + ylab("Count")
+
+# Distribution poids
+plot_distrib_poids <- ggplot(metadata, aes(x = poids)) + 
+  geom_histogram(binwidth = 5) +
+  theme_bw() + xlab("Poids (kg)") + ylab("Count")
+
+# Distribution score EPICES
+plot_distrib_epices <- ggplot(metadata, aes(x = score_epices)) + 
+  geom_histogram(binwidth = 10) +
+  theme_bw() + xlab("Score EPICES") + ylab("Count") +
+  geom_vline(xintercept=30, color="red", linetype="dashed")
+
+grid.arrange(plot_distrib_age, plot_distrib_taille, plot_distrib_poids, plot_distrib_epices, ncol = 2)
+```
+
+On peut voir premièrement que la cohorte est biaisé vers des individus autour de 20 ans (des étudiants). On va donc catégoriser l'âge en "Moins de 30 ans" et "Plus de 30 ans".
+
+La taille est distribuée normalement chez les individus.
+
+Le poids est aussi distribué de manière bimodale, avec un pool de poids autour de 60 kg et un autour de 75 kg, probablement les femmes et les hommes.
+
+Enfin on a représenté en rouge, sur la distribution du score EPICES, le seuil de précarité. On observe que la majorité des individus est non précaire. On va tout de même catégorisé en "Précaire" et "Non Précaire".
+
+```{r categorisation_1}
+# Catégorisation de l'âge
+metadata <- metadata %>%
+  #mutate(age_group = if_else(age >= 40, "above_40", if_else(age >= 25, "25-40", "below_25")))
+  mutate(age_group = if_else(age >= 40, "above_40", "below_40"))
+
+#Catégorisation de la précarité
+metadata <- metadata %>%
+  mutate(precarity_group = if_else(score_epices >= 30, "Précaire", "Non Précaire"))
+
+# True = + d'1 enfant
+metadata$nombre_enfants <- metadata$nombre_enfants >= 1
+```
+
+Voyons le résumé des caractéristiques qualitatives des métadonnées (hors diet et précarité que nous allons traiter séparément en raison de leur grands nombre et qui nécessite donc des ACP).
+
+```{r visualisation_metadata_3}
+theme_gtsummary_compact()
+
+metadata %>% tbl_summary(include = c(sex, code_postal, pays_de_naissance, voie_accouchement, allaitement, nombre_foyer, sport_frequence, age_group, precarity_group))
+```
+On observe plus de femmes que d'hommes mais le tout est assez équilibré (59% de femmes).
+
+Les gens se répartissent globalement dans le nord de Paris et proche banlieue.
+
+La majorité des individus est née en France, via voie vaginale et allaitée au sein.
+
+Un tiers des personnes sont seuls (ce sont beaucoup d'étudiants) chez eux. Les autres sont en famille / couple.
+
+On voit que certaines modalités de variables sont sous représentées mais les variables restent intéressantes. Il serait bien de créer des classes plus larges pour tirer plus de puissance de ces réponses. Nous allons dire que "Nombre Foyer" peut se répartir en 2 catégories : "Faible (1 ou 2) / Elevé (+ de 2)" ; Les codes postaux permettent de catégoriser en "Paris / Banlieue" ; La fréquence du sport permet de catégoriser en "Sport Fréquent / Sport Peu Fréquent".
+
+```{r categorisation_2}
+# Catégorisation ménage
+metadata <- metadata %>%
+  mutate(foyer_group = if_else(nombre_foyer > 2, "Fort", "Faible"))
+
+# Catégorisation villes
+metadata <- metadata %>%
+  mutate(ville_group = if_else(startsWith(as.character(metadata$code_postal), '7'), "Paris", "Banlieue"))
+
+#Catégorisation fréquence sport
+metadata <- metadata %>%
+  mutate(sport_group = if_else((sport_frequence == 4 | sport_frequence == 5) , "Fréquent", "Non fréquent"))
+```
+
+## Dataframe `antibiotique`
+
+On crée le second jeu de données : `antiobiotique` qui regroupe toutes les informations sur la prise d'antibiotique de chaque hôte pendant toute la cohorte. Ces données viennent à la fois de la première visite mais aussi des visites de contrôle.
+
+```{r traitement_2}
+# On crée d'abord un df avec uniquement les informations sur les prises d'antibiotiques
+antibiotique <- metadata_complete %>%
+  dplyr::select(-c(3:77, 89:121, 134:185)) %>% # Selection des colonnes concernant les antibiotiques
+  filter(antibiotique_oui_non == 1 | suivi_antibiotique_oui_non == 1) %>% # Selection de tous les traitements antibiotiques
+  filter(!record_id %in% to_exclude) %>% # On exclue les traitements antibiotiques par les patients qui n'ont pas fini la cohorte
+  mutate(across(everything(), ~ ifelse(is.na(.), "", .))) %>% # On enlève tous les NA pour pouvoir merge les colonnes entre elles
+  unite(date_traitement, date_traitement_1, suivi_date_traitement_1, sep = "") %>% # On unifie les traitements de suivi et d'inclusion et ceux pour toutes les informations
+  unite(traitement, traitement_1, suivi_traitement_1, sep = "") %>%
+  unite(jours_traitement, jours_traitement_1, suivi_jours_traitement_1, sep = "") %>%
+  unite(prises_traitement, prises_traitement_1, suivi_prises_traitement_1, sep = "") %>%
+  unite(voie_traitement, voie_traitement_1, suivi_voie_traitement_1, sep = "") 
+
+# Pour gérer les cas de traitements multiples, on va les sélectionner et les bind en tant que nouvelles lignes
+antibiotique_multiple_inclusion <- antibiotique %>%
+  dplyr::select(record_id, redcap_event_name, ,c("date_traitement_2", "traitement_2", "jours_traitement_2", "prises_traitement_2", "voie_traitement_2")) %>%
+  rename("date_traitement" = date_traitement_2, "traitement" = traitement_2, "jours_traitement" = jours_traitement_2, "prises_traitement" = prises_traitement_2, "voie_traitement" = voie_traitement_2)
+
+antibiotique_multiple_suivi <- antibiotique %>%
+  dplyr::select(record_id, redcap_event_name, ,c("suivi_date_traitement_2", "suivi_traitement_2", "suivi_jours_traitement_2", "suivi_prises_traitement_2", "suivi_voie_traitement_2")) %>%
+  rename("date_traitement" = suivi_date_traitement_2, "traitement" = suivi_traitement_2, "jours_traitement" = suivi_jours_traitement_2, "prises_traitement" = suivi_prises_traitement_2, "voie_traitement" = suivi_voie_traitement_2)
+
+# On prépare le merge des df
+antibiotique <- antibiotique %>%
+  dplyr::select(record_id, redcap_event_name, date_traitement, traitement, jours_traitement, prises_traitement, voie_traitement) # On récupère que les colonnes intéressantes
+
+# On merge tous les df
+antibiotique <- bind_rows(antibiotique, antibiotique_multiple_inclusion, antibiotique_multiple_suivi) %>% filter(date_traitement != "")
+
+antibiotique$date_traitement <- as.Date(antibiotique$date_traitement)
+```
+
+Chaque ligne de `antibiotique` représente un traitement pris par un individu avec la date du traitement, le type de traitement et des informations sur celles-ci.
+
+## Dataframe `voyage`
+
+On crée le troisième jeu de données : `voyage` qui regroupe toutes les informations sur les voyages de chaque hôte pendant toute la cohorte. Ces données viennent à la fois de la première visite mais aussi des visites de contrôle.
+
+```{r traitement_3}
+# On crée d'abord un df avec uniquement les informations sur les voyages
+voyage <- metadata_complete %>%
+  dplyr::select(-c(3:107, 118:152, 166:185)) %>% # Selection des colonnes concernant les voyages
+  filter(voyage == 1 | suivi_voyage == 1) %>%  # Selection de tous les voyages
+  filter(!record_id %in% to_exclude) %>% # On exclue les voyages par les patients qui n'ont pas fini la cohorte
+  mutate(across(everything(), ~ ifelse(is.na(.), "", .))) %>% # On enlève tous les NA pour pouvoir merge les colonnes entre elles
+  unite(date_voyage, date_voyage_1, suivi_date_voyage_1, sep = "") %>% # On unifie les voyages de suivi et d'inclusion, et ceux pour toutes les informations
+  unite(duree_voyage, duree_voyage_1, suivi_duree_voyage_1, sep = "") %>%
+  unite(pays_voyage, pays_voyage_1, suivi_pays_voyage_1, sep = "")
+
+# Pour gérer les cas de voyages multiples, on va les sélectionner et les bind en tant que nouvelles lignes
+voyage_multiple_inclusion_1 <- voyage %>%
+  dplyr::select(record_id, redcap_event_name, ,c("date_voyage_2", "duree_voyage_2", "pays_voyage_2")) %>%
+  rename("date_voyage" = date_voyage_2, "duree_voyage" = duree_voyage_2, "pays_voyage" = pays_voyage_2)
+
+voyage_multiple_inclusion_2 <- voyage %>%
+  dplyr::select(record_id, redcap_event_name, ,c("date_voyage_3", "duree_voyage_3", "pays_voyage_3")) %>%
+  rename("date_voyage" = date_voyage_3, "duree_voyage" = duree_voyage_3, "pays_voyage" = pays_voyage_3)
+
+voyage_multiple_suivi_1 <- voyage %>%
+  dplyr::select(record_id, redcap_event_name, ,c("suivi_date_voyage_2", "suivi_duree_voyage_2", "suivi_pays_voyage_2")) %>%
+  rename("date_voyage" = suivi_date_voyage_2, "duree_voyage" = suivi_duree_voyage_2, "pays_voyage" = suivi_pays_voyage_2)
+
+voyage_multiple_suivi_2 <- voyage %>%
+  dplyr::select(record_id, redcap_event_name, ,c("suivi_date_voyage_3", "suivi_duree_voyage_3", "suivi_pays_voyage_3")) %>%
+  rename("date_voyage" = suivi_date_voyage_3, "duree_voyage" = suivi_duree_voyage_3, "pays_voyage" = suivi_pays_voyage_3)
+
+voyage_multiple_suivi_3 <- voyage %>%
+  dplyr::select(record_id, redcap_event_name, ,c("suivi_date_voyage_4", "suivi_duree_voyage_4", "suivi_pays_voyage_4")) %>%
+  rename("date_voyage" = suivi_date_voyage_4, "duree_voyage" = suivi_duree_voyage_4, "pays_voyage" = suivi_pays_voyage_4)
+
+# On prépare le merge des df
+voyage <- voyage %>%
+  dplyr::select(record_id, redcap_event_name, date_voyage, duree_voyage, pays_voyage) # On récupère que les colonnes intéressantes
+
+# On merge tous les df
+voyage <- bind_rows(voyage, voyage_multiple_inclusion_1, voyage_multiple_inclusion_2, voyage_multiple_suivi_1, voyage_multiple_suivi_2, voyage_multiple_suivi_3) %>% filter(date_voyage != "")
+
+voyage$date_voyage <- as.Date(voyage$date_voyage)
+```
+
+Chaque ligne de `voyage` représente un voyage fait par un individu avec sa durée, la date et la destination.
+
+# Réduction de la dimensionalité de la diet et de la précarité
+
+La diet est représentée par 20 variables et la précarité par 9 variables. Il est donc intéressant de réduire leur dimensionalité, même si ceci va s'accompagner par une perte de l'information.
+
+## Pour la diet
+
+Nous allons mener une PCA (analyse des correspondances multiples à un moment --\> non car enlève l'ordonalité de nos données) sur les données de nutrition pour essayer de réduire la dimensionalité de nos données et de dégager des régimes alimentaires typiques.
+
+```{r ACP_diet}
+# ACP
+res <- PCA(metadata[,11:31], scale.unit = T, ncp = 5, graph = F)
+
+# Diagramme des éboulis
+fviz_screeplot(res)
+
+# Contribution de chaque variables
+res$var$contrib
+
+# Graphes des variables
+fviz_pca_var(res, axes = c(1, 2))
+
+# Graphes des individus
+fviz_pca_ind(res, axes = c(1,2), invisible = 'quali', col.ind = 'contrib')
+```
+
+Les variables de régime alimentaire sont relativement indépendantes les unes des autres et il est difficile d'établir des corrélations biologiquement indicatives entre elles. Ainsi, dans la cohorte les individus ont des régimes relativement proches. Ceci n'est pas étonnant sachant que les individus partagent la même zone géographique, des caractéristiques socio-économiques proches et un mode de vie proche (beaucoup d'étudiants).
+
+On peut essayer une ACM car on a des variables qualitatives.
+
+```{r acm}
+diet <- metadata[,11:31]
+
+# Pour une ACM dans R les variables doivent êtres des facteurs
+diet[] <- lapply(diet, function(x) if(is.numeric(x)) as.factor(x) else x)
+
+# ACM
+res.acm <- MCA(diet)
+
+# Graphe des individus
+fviz_screeplot(res.acm, addlabels = TRUE)
+```
+
+On voit que 1 dimension explique 6% ce qui est très mauvais sachant que notre jeu de donnée de base a 20 variables ie on s'attend à 5% par variables (pas sûr).
+
+On peut tout de même essayer de mener un clustering pour dégager des groupes alimentaires principaux. On va faire une heatmap avec clustering hiérarchique des individus basés sur les 20 variables de régimes alimentaires.
+
+```{r heatmap}
+diet <- metadata[,11:31]
+
+# On met scale = "column" pour centrer et réduire en fonction des réponses moyennes des individus car chaque personne répond différemment et interprête différemment le questionnaire
+heatmap_diet <- pheatmap(diet, scale = "column", clustering_method = "ward.D2")
+
+heatmap_diet
+
+ggsave(
+  filename = "heatmap.png",  # extension decides format
+  plot     = heatmap_diet,                # which plot to save
+  width    = 10,                # in inches
+  height   = 10,
+  dpi      = 300               # resolution
+)
+# Marche pas en knit ?
+#pheatmap(diet, scale = "column", clustering_method = "ward.D2", annotation_row = metadata[, c(2,3) ,drop = FALSE])
+```
+
+De haut en bas de l'arbre des hôtes :
+
+On observe un groupe monophylétique d'hôtes qui consomment plus d'alcool et de viande que les autres, peu de fibre et des produits laitiers en quantité normale. On les appellera groupe "régime faible en fibre" compte tenu de l'âge avancé des personnes ayant ce régime. 
+
+On observe un groupe monophylétique d'hôtes qui consomment plus d'oeufs, de légumes secs et fruits ainsi que d'aliments complets que les autres. Ce groupe consomme de l'alcool de manière relativement normal, peu de produits sucrés et salés gras. On les appellera groupe "régime haut en fibre".
+
+On observe un troisième groupe monophylétique de personnes mangeant de tout de manière régulière, sauf de l'alcool. On appellera ce groupe "régime équilibré".
+
+On observe enfin un quatrième groupe monophylétique de personnes mangeant peu de fibres et pas mal de produits sucrés/salés gras, boissons sucrées et matières grasses. Ils ne consomment relativement peu d'alcools et de manière normale les autres aliments. On appellera ce groupe "régime équilibré".
+
+On peut fusionner le troisième et quatrième groupe en un régime équilibré moderne, c'est à dire un régime avec peu d'alcool quelques boissons sucrées et le reste assez équilibré.
+
+On peut ajouter au dataframe `metadata` une colonne régime alimentaire en fusionnant 3 et 4.
+
+```{r régime, include=T}
+regime = rep("", 46)
+
+regime = as.data.frame(regime)
+
+row.names(regime) <- row.names(metadata)
+
+metadata <- cbind(metadata, regime)
+
+traditionel = c(23, 3, 15, 7, 10, 24, 34, 18, 21, 22, 16, 5, 19, 40)
+
+haut_fibre = c(38, 30, 31, 14, 28, 4, 27, 9, 46, 29)
+
+moderne_equilibre = c(36, 33, 2, 20, 8, 39, 25, 41, 11, 17, 26, 45, 35, 44, 43, 12, 13, 1, 37, 32, 6, 42)
+
+#L'hôte ligne 29 est un outlier car probablement intolérant au lactose. Hors ceci il est facile de voir sur la heatmap qu'il est plutôt dans le régime haut_fibre. 
+
+metadata$regime[row.names(metadata) %in% traditionel] <- -1 # Alcool
+
+metadata$regime[row.names(metadata) %in% haut_fibre] <- 1 # Fibre
+
+metadata$regime[row.names(metadata) %in% moderne_equilibre] <- 0 # Équilibré
+```
+
+Voyons si les groupes alimentaires sont bien appuyés statistiquement.
+
+```{r cluster, include=T, eval=FALSE}
+# Compute the distance matrix
+diet_eucl_sc <- dist(scale(diet))
+
+# Perform hierarchical clustering with bootstrap resampling
+result <- pvclust(t(scale(diet)), method.hclust = "ward.D2", method.dist = "euclidian", nboot = 100)
+
+# Plot dendrogram with bootstrap values
+plot(result)
+```
+
+Les groupes ne sont pas appuyés statistiquement. On ne sait pas si c'est un problème de puissance ou du fait que comme les régimes sont proches les uns des autres qui fait que le bootstrap n'est pas élevé.
+
+Vérifions si nos groupes alimentaires représente bien les individus :
+
+Essayons de voir si les régimes clusterisent bien les individus sur la PCA des variables nutritives.
+
+```{r ACP_régime}
+# PCA
+res <- PCA(metadata[,11:31], scale.unit = T, ncp = 5, graph = F)
+
+# Graphe des individus en colorant les 3 régimes alimentaires 
+plot_pca_indiv_diet <- fviz_pca_ind(res, axes = c(1,2), invisible = 'quali', col.ind = metadata$regime, addEllipses = T)
+
+plot_pca_indiv_diet
+```
+
+Les PCA semblent montrer que le partitionnement en 3 régimes semblent assez bien clusteriser la population et expliquer les variables nutritives.
+
+Faisons des corrélations pour voir si les régimes et les variables nutritives marchent bien ensemble. 
+
+```{r correlation_nutrition}
+# Corrélation avec les 3 régimes alimentaires
+res.cor <- corr.test(as.data.frame(as.numeric(as.factor(metadata$regime))),  metadata[,11:31], method="spearman")
+
+# Légende
+rownames(res.cor$r) <- "régime"
+
+# Légende
+rownames(res.cor$p.adj) <- "régime"
+
+# Représentation
+corrplot(res.cor$r, p.mat = res.cor$p.adj, sig.level = 0.1, tl.srt = 25, tl.cex	= .5, cl.length = 5)
+```
+
+Ce qui se passe, c'est que nos régimes expliquent bien les variables qui drive le plus la diet en général. Ainsi notre variable régime permet de réduire la dimensionnalité mais en perdant de l'information sur des variables nutritives ayant peu de variance (dues au faible nombre de personne et à la relative ressemblance des régimes alimentaires de nos jours, surtout dans une zone géographique telle).
+
+## Pour la précarité
+
+Le score EPICES déjà calculé a été construit pour résumer la précarité des hôtes. Vérifions que c'est le cas avec une PCA sur les variables de précarité et en colorant avec le score PCA.
+
+```{r ACP_2}
+# ACP
+res <- PCA(metadata, scale.unit = T, ncp = 3, graph = F, quanti.sup = c(3:5,44), quali.sup = c(1:2,6:32,43, 45:50))
+
+# Contribution de chaque variables aux axes de PCA
+res$var$contrib
+
+# Graphes des variables
+fviz_pca_var(res, axes = c(1, 2))
+```
+
+60% de la variance est capturée par les 3 premiers axes. Le premier axe correspond à un axe financier (travailleur social, difficulté financière, activités : spectacles & vacances et aides), le deuxième résume la composante du ménage (propriété, couple, mutuelle et vacances). Le troisième axe résume la composante santé (sport, aide, difficulté financière).
+
+On représente le graphe des individus sur les 3 premiers axes et on colore par le score epices pour vérifier si celui ci est un bon indicateur de précarité.
+
+```{r ACP_3}
+#En partie fait avec GPT
+# ACP
+res.pca <- PCA(metadata, scale.unit = T, ncp = 3, graph = F, quanti.sup = c(3:5), quali.sup = c(1:2,6:31,43:44, 45:50))
+
+# En 2D
+fviz_pca_ind(res.pca, axes = c(1,2), invisible = 'quali', col.ind = metadata$score_epices )+
+  scale_color_gradient(name = "EPICES Score", low = "blue", high = "red") + 
+  theme_minimal() +
+  theme(legend.position = "right") + 
+  ggtitle("PCA of Precarity")
+
+# On transforme le score epices en factor
+metadata$score_epices_factor <- as.factor(metadata$score_epices)
+
+# Extraire les coordonnées des individus sur les 3 premières composantes
+ind_coords <- res.pca$ind$coord[, 1:3]
+ind_coords <- as.data.frame(ind_coords)
+colnames(ind_coords) <- c("Dim1", "Dim2", "Dim3")
+
+# Add jitter to avoid stacked points
+set.seed(123)  # For reproducibility
+ind_coords$Dim1 <- jitter(ind_coords$Dim1, amount = 0.2)
+ind_coords$Dim2 <- jitter(ind_coords$Dim2, amount = 0.2)
+ind_coords$Dim3 <- jitter(ind_coords$Dim3, amount = 0.2)
+
+# Ajouter les étiquettes des individus
+ind_coords$Individu <- rownames(ind_coords)
+
+# Add the condition column
+ind_coords$epices <- metadata$score_epices_factor  # Assign original epices to PCA result
+
+# Création du graphe 3D avec plotly
+fig <- plot_ly(ind_coords, x = ~Dim1, y = ~Dim2, z = ~Dim3, text = ~Individu,
+               type = "scatter3d", mode = "markers",
+               marker = list(size = 5, color = ~epices, opacity = 0.7))
+
+axx <- list(
+  nticks = 4,
+  range = c(min(res.pca$ind$coord[,1]),max(res.pca$ind$coord[,1])))
+
+
+axy <- list(
+  nticks = 4,
+  range = c(min(res.pca$ind$coord[,2]),max(res.pca$ind$coord[,2])))
+
+
+axz <- list(
+  nticks = 4,
+  range = c(min(res.pca$ind$coord[,3]),max(res.pca$ind$coord[,3])))
+
+# Ajouter des titres
+fig <- fig %>% layout(#title = "Graphe des individus en 3D (ACP)",
+                      scene = list(xaxis = axx,
+                                   yaxis = axy,
+                                   zaxis = axz),
+                      legend = list(title = list(text = "epices")))
+
+# Affichage
+fig
+
+metadata$score_epices_factor <- NULL
+```
+
+Le score EPICES est cohérent avec la PCA sur les questions de précarité que ce soit en 2D qu'en 3D.
+
+Corrélons le score EPICES aux variables de précarité.
+
+```{r correlation}
+# Correlation
+res.cor.epices <- corr.test(as.data.frame(metadata$score_epices),  metadata[,33:42], method="spearman")
+
+# Légende
+rownames(res.cor.epices$r) <- "score EPICES"
+
+# Légende
+rownames(res.cor.epices$p.adj) <- "score EPICES"
+
+# Plot
+corrplot(res.cor.epices$r, p.mat = res.cor.epices$p.adj, sig.level = 0.1, tl.srt = 25, tl.cex	= .5, cl.length = 5)
+```
+
+On voit que le score EPICES est bien corrélé positivement (significativement) aux variables qui indiquent la précarité et négativement aux variables qui indiquent la non-précarité.
+
+Il est donc un bon indicateur de précarité et il permet de réduire la dimension de nos variables socio-économiques à une seule variable.
+
+# Corrélations entres les caractéristiques hôtes
+
+## Corrélations individuelles
+
+Pour commencer, nous allons établir des corrélations entre les variables continues et le score EPICES.
+
+```{r correlation_1}
+#Corrélations
+ggpairs(dplyr::select(metadata, age, taille_cm, poids, score_epices, sport_frequence), upper = list(continuous = wrap(ggally_cor, method = "spearman")))
+```
+
+L'âge semble décorellé de la précarité chez nos participants. 
+
+Il semble y avoir des corrélations négatives (non significatives) entre la précarité et la fréquence de l'activité physique mais aussi le poids.
+
+On observe une corrélation significative entre le poids et la taille et entre le poids et la fréquence du sport.
+
+Voyons si le score EPICES est corrélé aux variables de nutrition.
+
+```{r correlation_epices_nutrition}
+df <- data.frame(metadata$score_epices)
+
+res.cor <- corr.test(df,  metadata[,11:31], method="spearman")
+
+corrplot(res.cor$r, p.mat = res.cor$p.adj, sig.level = 0.05, tl.srt = 25, tl.cex	= .5)
+
+# Sans p-value car sinon on voit rien
+corrplot(res.cor$r, tl.srt = 25, tl.cex	= .5)
+```
+
+On observe des corrélations mais aucune d'elle n'est significative une fois les p-value ajustées. Ceci peut venir d'un manque de puissance face à notre petit échantillon.
+
+Les corrélations les plus intéressantes sont : - Les personnes les plus précaires mangent plus de : viandes rouges, poisson, apéritifs. - Les personnes les plus précaires mangent moins de charcuteries, de viandes blanches, œufs, de fruits et légume et de bière.
+
+Mais encore une fois assez peu de schémas se dégagent en raison de la relative indépendance de chaque variables nutritives au niveau des individus. C'est donc normal d'avoir du mal à voir que des classes sociales auraient un régime différent car les individus entre eux n'ont pas un régime très différent.
+
+On peut essayer de faire la même corrélation mais entre le score EPICES et les régimes alimentaires.
+
+```{r correlation_preca_diet}
+ggpairs(dplyr::select(metadata, regime, score_epices), upper = list(continuous = wrap(ggally_cor, method = "spearman")))
+```
+
+La corrélation n'est pas significative mais mieux que précédemment. Peut être qu'ajouter des individus rendra le tout significatif.
+
+De plus amples analyses avec le jeu de données qui arrive permettront peut être d'éclaircir ces questions.
+
+Comment corrèlent le sex et le régime ? Pour cela on peut utiliser un test exacte de Fisher.
+
+```{r sex_regime}
+metadata$sex <- as.factor(metadata$sex)
+
+contingence <- table(metadata$regime, metadata$sex)
+
+fisher.test(contingence)
+```
+Le sexe et le régime ne sont pas indépendants, significativement par un test exact de Fisher (et aussi par un test de Chi²). Le régime alcool (-1) est associé à plus d'hommes que de femmes. Les deux autres régimes sont plutôt bien équilibré en effectifs.
+
+Il faudra donc garder en compte que si l'un des deux à un effet alors ça peut être un effet indirect de l'autre.
+
+Regardons rapidement les autres métadonnées qui pourraient êtres liées à sex :
+
+```{r metadata_sex}
+# Sélectionner uniquement les variables qualitatives
+qualitatives <- metadata %>% dplyr::select(where(~ is.factor(.) || is.character(.) || n_distinct(.) < 10))
+
+for (var in names(qualitatives)) {
+  if (var != "sex") {  # Exclure la colonne 'sex'
+    cat("Test entre 'sex' et", var, "\n")
+    
+    # Créer la table de contingence
+    table_contingence <- table(metadata[[var]], metadata$sex)
+
+    # Vérifier la taille du tableau (Fisher uniquement si 2x2, sinon simulation)
+    if (all(table_contingence >= 5)) {
+      # Khi² car effectifs suffisants
+      test <- chisq.test(table_contingence)
+      cat("  ➡️ Test du Khi² : p-value =", test$p.value, "\n")
+    } else {
+      # Fisher car effectifs faibles
+      test <- fisher.test(table_contingence, simulate.p.value = TRUE, B = 10000)
+      cat("  ➡️ Test exact de Fisher : p-value =", test$p.value, "\n")
+    }
+  }
+}
+```
+
+Sur les variables continues : 
+
+```{r metadata_continue_sex}
+wilcox.test(as.numeric(metadata$sex), metadata$age)
+wilcox.test(metadata$score_epices, as.numeric(metadata$sex))
+wilcox.test(metadata$poids, as.numeric(metadata$sex))
+wilcox.test(metadata$taille_cm, as.numeric(metadata$sex))
+```
+
+L'âge, le poids, la taille et le score EPICES ne sont significativement pas pareils selon les deux sexes. Ceci est attendu pour la taille et le poids mais sera à prendre en compte pour la précarité et l'âge.
+
+En résumé, l'âge, la précarité et le régime ne sont pas distribuées pareil selon le sexe, ce qu'il faut garder en tête en cas d'effet du sexe sur les bactéries.
+
+## Corrélations globales entre tous les déterminants hôtes
+
+On va établir les corrélations entre les variables qui sont beaucoup sortis dans nos modèles.
+
+On va séparer les variables continues, discrète ordinale et discrète nominale.On met toutes les corrélations dans un fichier .pdf.
+
+```{r correlation_globale}
+#ON prend que les variables qui sont ressortis dans beaucoup de modèles
+vars_cont <- c("poids")
+
+vars_ord  <- c("nombre_foyer")
+
+vars_nom  <- c("sex", "age_group", "precarity_group","voie_accouchement", "allaitement", "nombre_enfants", "ville_group", "regime")
+
+metadata$voie_accouchement <- as.factor(metadata$voie_accouchement)
+metadata$allaitement <- as.factor(metadata$allaitement)
+
+# Charger les packages  
+library(lsr)       # pour etaSquared()
+library(rstatix)   # pour cramer_v()
+library(polycor)   # pour polyserial(), polychor()
+library(vcd)       # pour assocstats()
+
+all_vars <- c(vars_cont, vars_nom, vars_ord)
+
+library(ggplot2)
+library(vcd)
+
+plot_pair <- function(df, v1, v2,
+                       vars_cont, vars_ord, vars_nom) {
+  t1 <- if (v1 %in% vars_cont) "cont"
+        else if (v1 %in% vars_ord) "ord"
+        else "nom"
+  t2 <- if (v2 %in% vars_cont) "cont"
+        else if (v2 %in% vars_ord) "ord"
+        else "nom"
+  title_txt <- paste(v1, "vs", v2)
+  p <- NULL
+
+  if (t1 == "cont" && t2 == "cont") {
+    p <- ggplot(df, aes_string(x = v1, y = v2)) +
+         geom_point(alpha = 0.5) +
+         geom_smooth(method = "loess") +
+         ggtitle(title_txt)
+    
+  } else if ((t1 == "cont" && t2 == "nom") || (t1 == "nom" && t2 == "cont")) {
+    cont <- if (t1 == "cont") v1 else v2
+    nom  <- if (t1 == "nom") v1 else v2
+    # On suppose que nom est déjà un facteur dans df
+    p <- ggplot(df, aes_string(x = nom, y = cont)) +
+         geom_boxplot() +
+         ggtitle(title_txt)
+    
+  } else if ((t1 == "cont" && t2 == "ord") || (t1 == "ord" && t2 == "cont")) {
+    cont <- if (t1 == "cont") v1 else v2
+    ord  <- if (t1 == "ord") v1 else v2
+    p <- ggplot(df, aes_string(x = as.factor(ord), y = cont)) +
+         geom_boxplot() +
+         ggtitle(title_txt)
+    
+  } else if ((t1 == "ord" && t2 == "nom") || (t1 == "nom" && t2 == "ord")) {
+    ord <- if (t1 == "ord") v1 else v2
+    nom <- if (t1 == "nom") v1 else v2
+    p <- ggplot(df, aes_string(x = ord, fill = nom)) +
+         geom_bar(position = "dodge") +
+         ggtitle(title_txt)
+    
+  } else if (t1 == "ord" && t2 == "ord") {
+    tab <- as.data.frame(table(df[[v1]], df[[v2]]))
+    names(tab) <- c("x", "y", "Freq")
+    p <- ggplot(tab, aes(x = x, y = y, fill = Freq)) +
+         geom_tile() +
+         scale_fill_gradient(low = "white", high = "steelblue") +
+         ggtitle(title_txt)
+    
+  } else if (t1 == "nom" && t2 == "nom") {
+    mosaic(~ get(v1) + get(v2),
+           data = df,
+           shade = TRUE,
+           legend = TRUE,
+           main = title_txt,
+           labeling_args = list(set_varnames = c(v1, v2)))
+    return(invisible())
+  }
+  print(p)
+}
+
+# Sauvegarde dans un PDF
+pdf("all_pairs_plots.pdf", width=7, height=5)
+for (i in seq_along(all_vars)) {
+  for (j in (i+1):length(all_vars)) {
+    v1 <- all_vars[i]; v2 <- all_vars[j]
+    plot_pair(metadata, v1, v2,
+              vars_cont, vars_ord, vars_nom)
+  }
+}
+dev.off()
+
+```
+
+Les corrélations qui en ressortent sont : 
+
+- Poids et âge *
+- Poids et sexe *
+- Poids et nombre d'enfants *
+- Sexe et régime *
+- Sexe et nombre foyer .
+- Age et allaitement ** (les gens âgés ont oublié et sont sur représentés en 3, pas le cas pour l'accouchement)
+- Age et nombre d'enfants *** (les gens âgés ont un enfant)
+- Accouchement et allaitement *** (plus de gens qui ont oublié comment ils ont été allaité que comment ils sont nés. Souvent les gens ont oublié les deux si jamais ils ont oublié l'un.)
+- Allaitement et nombre d'enfants ** (les gens qui ne savent pas sont majoritairement des gens qui ont un enfant, âgés quoi)
+- Allaitement et régime * (les gens allaitées par leur mère sont sur représentés dans le régime équilibré)
+
+Code : "***" Tres significatif (d'après moi); ... ; "." piste
+
+
+
+# Sauvegarde variables
+
+Comme ceci est un child document on a pas envie de s'encombrer avec des variables inutiles.
+
+```{r}
+# Je sauve les objets pour qu'ils soient dispo plus tard
+save(to_exclude, voyage, metadata, metadata_complete, antibiotique, heatmap_diet, plot_pca_indiv_diet, haut_fibre, moderne_equilibre, traditionel, plot_distrib_age, plot_distrib_epices, plot_distrib_poids, plot_distrib_taille, res.cor.epices, file = "metadata.RData")
+```
+
+

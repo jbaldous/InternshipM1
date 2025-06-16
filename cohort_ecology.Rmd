@@ -1,0 +1,1033 @@
+---
+title: "cohort"
+author: "Jules Baldous"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = FALSE, error = TRUE)
+rm(list = ls())
+
+load(file="metadata.RData")
+load(file="cohort.RData")
+load(file="cohort_metadata.RData")
+```
+
+Alt + O pour replier tout et ouvrir que ce qui est pertinent.
+
+**Package nécessaires à l'exécution de ce document :**
+
+```{r package}
+library(dplyr)
+library(gtsummary)
+library(GGally)
+library(ggplot2)
+library(FactoMineR)
+library(factoextra)
+library(plotly)
+library(corrplot)
+library(scales)
+library(psych)
+library(pheatmap)
+library(pvclust)
+library(ggpmisc)
+library(ggbeeswarm)
+library(MASS)
+library(car)
+library(tidyr)
+library(gt)
+library(grid)
+library(gridExtra)
+library(cowplot)
+library(MuMIn)
+library(lme4)
+library(lmerTest)
+library(pscl)
+library(ggstats)
+library(lubridate)
+library(purrr)
+library(vegan)
+library(ggpubr)
+library(tibble)
+```
+
+# Diversité interhôtes : profil de phylogroupe
+
+## Clustering et profil phylogroupe via présence absence
+
+On va récolter pour chaque hôte les différents phylogroupes qui l'ont colonisé puis faire une distance de bray curtis binaire (sur oui/non le phylogroupe est partagé entre hôtes).
+
+```{r bc_between_host, fig.height=45, fig.width=10}
+pa_matrix <- longitudinal %>%
+  distinct(host, group) %>%       # garde une seule ligne par combinaison host/phylogroupe
+  mutate(presence = 1) %>%
+  pivot_wider(names_from = group, values_from = presence, values_fill = 0)
+
+abund_matrix <- pa_matrix %>%
+  dplyr::select(-host)
+
+bc_hosts <- vegdist(abund_matrix, method = "bray", binary = TRUE)
+
+bc_df <- as.matrix(bc_hosts) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("host1") %>%
+  pivot_longer(-host1, names_to = "host2", values_to = "bray_curtis") #%>%
+  #filter(host1 != host2) #%>% #On enlève les paires de même host
+  #filter(as.numeric(host1) < as.numeric(host2)) #Pour éliminer les doublons de paires
+
+bc_df <- bc_df %>%
+  mutate(
+    host1 = factor(host1, levels = sort(unique(as.numeric(host1)))),
+    host2 = factor(host2, levels = sort(unique(as.numeric(host2))))
+  )
+
+plot_bc_host <- ggplot(bc_df, aes(x = host2, y = bray_curtis)) + 
+  facet_grid(
+    rows = vars(host1), 
+    scales = "free_x", 
+    space = "free_x", 
+    labeller = labeller(host1 = function(value) paste0("Host ", value))
+  ) +
+  xlab("Host Compared With") + 
+  geom_point() + 
+  ylab("Bray Curtis Distance") +
+  theme_bw()
+
+plot_bc_host
+```
+
+On voit que certains hôtes ont clairement des BC très proche ou très loin de 0 ce qui veut dire qu'on a des hôtes partageant les mêmes phylogroupes. 
+
+En moyenne les points sont autour de 0.5 mais on peut voir que certains hôtes ont plutôt des BC faibles et d'autres élevées, en fonction de si leur profil phylogénétique est commun ou assez original. Cette variabilité nous pousse à nous demander si nos hôtes pourraient avoir des profils phylogénétiques particulier. On va faire une heatmap avec des dendogrammes pour voir si des cluster peuvent êtres obtenus par la présence/absence des phylogroupes.
+
+```{r heatmap_phylogenetic_profile_, fig.height=10, fig.width=10}
+# On repart de pa_matrix qu'on va coller aux métadonnées (utiles pour la suite)
+heatmap_df <- metadata %>%
+  dplyr::select(-c(11:42)) %>%
+  dplyr::rename(host = record_id) %>%
+  mutate(host = as.character(host))
+
+heatmap_df <- heatmap_df %>%
+  left_join(pa_matrix)
+
+mat <- heatmap_df[, 19:30]
+ann <- heatmap_df[, c(2,18), drop = FALSE]
+
+rownames(mat) <- heatmap_df$host
+rownames(ann) <- heatmap_df$host
+
+heatmap_phylogroupe <- pheatmap(mat,
+         #scale = "column",
+         clustering_method = "ward.D2",
+         annotation_row = ann)
+```
+
+Cette heatmap nous renseigne sur plusieurs choses. Certains phylogroupes semblent êtres portés souvent par pairs : B1 et D1 ou A1 et A2. 
+
+Il est assez difficile d'obtenir des profils de phylogroupes qui pourraient clusteriser des hôtes entre eux. Peut être que c'est parce qu'on considère uniquement la présence/absence. On peut essayer de faire une heatmap basé sur la distance de bray curtis entre les hôtes pour obtenir des groupes d'hôtes proches.
+
+```{r bc_heatmap, fig.height=10, fig.width=10}
+# corriger par fréquence
+
+bc_df <- as.matrix(bc_hosts) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("host1") %>%
+  pivot_longer(-host1, names_to = "host2", values_to = "bray_curtis") #%>%
+  #filter(host1 != host2) %>% #On enlève les paires de même host
+  #filter(as.numeric(host1) < as.numeric(host2)) #Pour éliminer les doublons de paires
+
+# Pour que la matrice soit bien triée
+bc_df <- bc_df %>%
+  mutate(
+    host1 = factor(host1, levels = sort(unique(as.numeric(as.character(host1))))),
+    host2 = factor(host2, levels = sort(unique(as.numeric(as.character(host2)))))
+  )
+
+distance_matrix <- bc_df %>%
+  spread(key = host2, value = bray_curtis, fill = 0) %>%
+  column_to_rownames("host1") %>%
+  as.matrix()
+
+pheatmap(
+  distance_matrix,
+  clustering_distance_rows = "euclidean",  # Utilisation de la distance euclidienne pour le clustering
+  clustering_distance_cols = "euclidean",
+  clustering_method = "ward.D2",  # Méthode de clustering
+  main = "Bray-Curtis Distance Heatmap"
+)
+```
+
+
+On observe deux cluster avec des distances de Bray-Curtis similaires entre eux c'est à dire avec une composition en phylogroupe similaire entre eux. Ces deux cluster sont eux mêmes dans un groupe monophylétique. 
+Voyons à quelle phylogroupe correspond ces hôtes :
+
+```{r phylogroupe_cluster}
+cluster_1 <- c(13, 27, 11, 14, 10, 2, 46, 1, 33, 41, 31)
+cluster_2 <- c(9, 23, 43, 30, 42, 38, 20, 3, 16, 7, 29, 44, 28, 19, 22, 21, 26, 35, 39)
+
+cluster_glob <- c(cluster_1, cluster_2)
+
+# Ajouter une colonne pour indiquer le groupe
+heatmap_df$group <- ifelse(
+  heatmap_df$host %in% cluster_1, "Cluster1",
+  ifelse(heatmap_df$host %in% cluster_2, "Cluster2", "Cluster3")
+)
+
+# Sélectionner les colonnes d'intérêt en incluant la variable 'group'
+df_selected <- dplyr::select(heatmap_df, group, 19:31)
+
+# Créer le résumé avec tbl_summary pour comparer selon 'group'
+summary_combined <- tbl_summary(
+  data = df_selected,
+  by = "group"
+) %>%
+  # Ajouter une colonne supplémentaire qui présente le résumé global de tous les groupes
+  add_overall()
+
+# Affichage du tableau résumé
+summary_combined
+```
+
+Les hôtes du cluster 1 ont majoritairement des D.1, des A.1 et des A.2 (et aussi des B.1) mais peu de B2.3 et de E.
+
+Les hôtes du cluster 2 ont tous des B2.3, des A.2, des B.1 (des A.1, des D.1 et des E).
+
+## Clustering et profil phylogroupe par prévalence
+
+On va récolter pour chaque hôte les différents phylogroupes qui l'ont colonisé puis faire une distance de bray curtis (sur la prévalence des phylogroupes partagés entre hôtes).
+
+```{r bc_between_host_, fig.height=45, fig.width=10}
+pa_matrix <- longitudinal %>%
+  group_by(host) %>%
+  mutate(nombre_souches = n()) %>%
+  group_by(host, group) %>%
+  summarise(prevalence = n() / unique(nombre_souches) * 100, .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = prevalence, values_fill = 0)
+
+abund_matrix <- pa_matrix %>%
+  dplyr::select(-host)
+
+bc_hosts <- vegdist(abund_matrix, method = "bray")
+
+bc_df <- as.matrix(bc_hosts) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("host1") %>%
+  pivot_longer(-host1, names_to = "host2", values_to = "bray_curtis") #%>%
+  #filter(host1 != host2) #%>% #On enlève les paires de même host
+  #filter(as.numeric(host1) < as.numeric(host2)) #Pour éliminer les doublons de paires
+
+bc_df <- bc_df %>%
+  mutate(
+    host1 = factor(host1, levels = sort(unique(as.numeric(host1)))),
+    host2 = factor(host2, levels = sort(unique(as.numeric(host2))))
+  )
+
+plot_bc_host_prev <- ggplot(bc_df, aes(x = host2, y = bray_curtis)) + 
+  facet_grid(
+    rows = vars(host1), 
+    scales = "free_x", 
+    space = "free_x", 
+    labeller = labeller(host1 = function(value) paste0("Host ", value))
+  ) +
+  xlab("Host Compared With") + 
+  geom_point() + 
+  ylab("Bray Curtis Distance") +
+  theme_bw()
+```
+
+On voit que certains hôtes ont clairement des BC très proche ou très loin de 0 ce qui veut dire qu'on a des hôtes partageant les mêmes phylogroupes. 
+
+En moyenne les points sont assez élevés mais on peut voir que certains hôtes ont plutôt des BC faibles en fonction de si leur profil phylogénétique est commun ou assez original. Cette variabilité nous pousse à nous demander si nos hôtes pourraient avoir des profils phylogénétiques particulier. On va faire une heatmap avec des dendogrammes pour voir si des cluster peuvent êtres obtenus grâce à des similarités dans la prévalence des souches.
+
+```{r heatmap_phylogenetic_profile, fig.height=10, fig.width=10}
+# On repart de pa_matrix qu'on va coller aux métadonnées (utiles pour la suite)
+heatmap_df <- metadata %>%
+  dplyr::select(-c(11:42)) %>%
+  dplyr::rename(host = record_id) %>%
+  mutate(host = as.character(host))
+
+heatmap_df <- heatmap_df %>%
+  left_join(pa_matrix)
+
+mat <- heatmap_df[, 19:30]
+ann <- heatmap_df[, c(2,18), drop = FALSE]
+
+rownames(mat) <- heatmap_df$host
+rownames(ann) <- heatmap_df$host
+
+heatmap_phylogroupe <- pheatmap(mat,
+         #scale = "column",
+         clustering_method = "ward.D2",
+         annotation_row = ann)
+```
+
+Cette heatmap nous renseigne sur plusieurs choses. Certains phylogroupes semblent pas être portés ensemble : comme le B2.3, le A.2 et le D.1 qui quand majoritaires semblent s'exclure.
+
+Il est assez difficile d'obtenir des profils de phylogroupes qui pourraient clusteriser des hôtes entre eux. On peut essayer de scale par phylogroupe pour tenir compte de la faible fréquence de certains phylogrupes.
+
+```{r heatmap_phylo}
+heatmap_phylogroupe_2 <- pheatmap(mat,
+         scale = "column",
+         clustering_method = "ward.D2",
+         annotation_row = ann)
+```
+
+On peut essayer de faire une heatmap basé sur la distance de bray curtis entre les hôtes pour obtenir des groupes d'hôtes proches.
+
+```{r bc_heatmap_, fig.height=10, fig.width=10}
+bc_df <- as.matrix(bc_hosts) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("host1") %>%
+  pivot_longer(-host1, names_to = "host2", values_to = "bray_curtis") #%>%
+  #filter(host1 != host2) %>% #On enlève les paires de même host
+  #filter(as.numeric(host1) < as.numeric(host2)) #Pour éliminer les doublons de paires
+
+# Pour que la matrice soit bien triée
+bc_df <- bc_df %>%
+  mutate(
+    host1 = factor(host1, levels = sort(unique(as.numeric(as.character(host1))))),
+    host2 = factor(host2, levels = sort(unique(as.numeric(as.character(host2)))))
+  )
+
+distance_matrix <- bc_df %>%
+  spread(key = host2, value = bray_curtis, fill = 0) %>%
+  column_to_rownames("host1") %>%
+  as.matrix()
+
+pheatmap(
+  distance_matrix,
+  clustering_distance_rows = "euclidean",  # Utilisation de la distance euclidienne pour le clustering
+  clustering_distance_cols = "euclidean",
+  clustering_method = "ward.D2",  # Méthode de clustering
+  main = "Bray-Curtis Distance Heatmap"
+)
+```
+
+On observe 3 cluster avec des distances de Bray-Curtis similaires entre eux c'est à dire avec une composition en phylogroupe similaire entre eux.
+
+Voyons à quelle phylogroupe correspond ces hôtes :
+
+```{r phylogroupe_cluster_}
+cluster_1 <- c(17, 34, 15, 25, 36, 3, 16, 40, 42, 35, 28, 39, 21, 38, 22, 26, 30)
+cluster_2 <- c(4, 12, 13, 32, 18, 44, 19, 29)
+#cluster_3 <- c(37, 20, 23, 33, 43, 24, 9, 11, 14)
+
+# Ajouter une colonne pour indiquer le groupe
+#heatmap_df$group <- ifelse(
+#  heatmap_df$host %in% cluster_1, "Cluster1",
+#  ifelse(heatmap_df$host %in% cluster_2, "Cluster2", ifelse(heatmap_df$host %in% cluster_3, "Cluster3", "Cluster4")))
+
+heatmap_df$group <- ifelse(
+  heatmap_df$host %in% cluster_1, "Cluster1",
+  ifelse(heatmap_df$host %in% cluster_2, "Cluster2", "Cluster3")
+)
+
+df_selected <- heatmap_df[, 19:31]
+df_selected[] <- lapply(df_selected, as.numeric)
+
+# Ajouter la colonne 'group'
+df_selected$group <- heatmap_df$group
+
+# Sélectionner les colonnes des phylogroupes (exclure 'group')
+phylogroupe_cols <- setdiff(names(df_selected), "group")
+
+# Calculer la moyenne par groupe
+mean_by_group <- df_selected %>%
+  group_by(group) %>%
+  summarise(across(all_of(phylogroupe_cols), mean, na.rm = TRUE))
+
+# Calculer la moyenne globale
+overall_mean <- df_selected %>%
+  summarise(across(all_of(phylogroupe_cols), mean, na.rm = TRUE)) %>%
+  mutate(group = "Global") %>%
+  dplyr::select(group, everything())
+
+# Combiner les moyennes par groupe avec la moyenne globale
+summary_table_preval <- bind_rows(mean_by_group, overall_mean)
+
+# Afficher le tableau récapitulatif
+print(summary_table_preval)
+```
+Les hôtes du cluster 1 ont majoritairement (et par rapport à la moyenne) des D.1 et des B2.3 mais peu de D.2, F et A.2 (par rapport à la moyenne).
+
+Les hôtes du cluster 2 ont majoritairement (et par rapport à la moyenne) des A.2 et D.2 et peu de B.1, F et E.
+
+Les hôtes du cluster 3 ont majoritairement (et par rapport à la moyenne) des F et moins de B1.
+
+On va vérifier que nos profils de phylogroupes sont significatifs
+
+```{r profil_sign}
+df_selected$group <- as.factor(df_selected$group)
+
+# Sélectionner uniquement les colonnes des phylogroupes (ici on suppose que ce sont les 12 premières colonnes)
+phylo_vars <- names(df_selected)[1:12]
+
+phylo_vars_reduced <- phylo_vars[phylo_vars != "G"]
+phylo_vars_reduced <- phylo_vars_reduced [phylo_vars_reduced  != "B2.1"]
+phylo_vars_reduced <- phylo_vars_reduced[phylo_vars_reduced != "C"]
+
+manova_model <- manova(as.matrix(df_selected[, phylo_vars_reduced]) ~ group, data = df_selected)
+
+summary(manova_model, test = "Pillai")
+
+# Pas significatif, peut être mieux d'utiliser quelque chose de non paramétrique car nos données ne satisfont probabelemnt pas les hypothèses du MANOVA.
+
+# Calculer une matrice de distance (exemple avec la distance euclidienne)
+distance_matrix <- vegdist(df_selected[, phylo_vars_reduced], method = "bray")
+
+# Réaliser la PERMANOVA
+permanova_model <- adonis(distance_matrix ~ group, data = df_selected)
+
+#print(permanova_model)
+```
+
+Les groupes n'ont pas l'air supportés statistiquement. Il faudrait plus de points pour essayer de faire des profils de phylogroupes.
+
+
+# Coportage et interactions interphylogroupes 
+
+Dans la partie précédente on a vu certains phylogroupes avaient l'air d'êtres peu associés ensemble ou plus souvent associés ensemble. Nous allons vérifier ceci en comparant la proportion des paires de phylogroupes observées à celles prédites par la théorie (à partir des proportions de phylogroupes observées dans la cohorte, et peut être corrigée).
+
+## Comparaison proportion de coportage observée et théorique
+
+Dans l'environnement chaque phylogroupe est en proportion p_i. Pour que deux phylogroupes différents soient portés en même temps on a donc p_i² pour deux souches d'un même phylogroupe et 2$p_i\*p_j pour deux phylogroupes différents. 
+
+On va calculer ces p_i avec nos données (et on pourra corriger par des données externes, mais on ne le fait pas en première approximation) et calculer dans nos données les fréquences de chaque paires de phylogroupes. Si celles ci sont les mêmes que celles attendues alors il n'y a pas forcément d'association entre les phylogroupes. En revanche si on observe qu'on a moins ou plus de fréquence de paires observées dans notre cohorte que théoriquement on pourra dire si certains phylogroupes s'aiment ou ne s'aiment pas.
+
+Calcul des proportions dans notre cohorte de chaque phylogroupe, et des proportions théoriques.
+
+```{r prop_theorique}
+# Nombre de souches total pour le calcul des prévalence de chaque phylogroupe dans la population.
+nombre_souches = as.numeric(nrow(longitudinal))
+
+# Proportions des phylogroupes dans la cohorte (qui est un sample de notre population totale)
+prop_phylogroupe_df <- longitudinal %>%
+  group_by(group) %>%
+  mutate(proportion = n()/nombre_souches) %>%
+  distinct(group, proportion)
+
+# Tous les couples possibles (y compris les couples symétriques)
+couples_df <- expand.grid(
+  membre1 = prop_phylogroupe_df$group,
+  membre2 = prop_phylogroupe_df$group,
+  stringsAsFactors = FALSE
+)
+
+# On crée deux colonnes de proportions
+couples_df <- couples_df %>%
+  left_join(prop_phylogroupe_df, by = c("membre1" = "group")) %>%
+  rename(p1 = proportion) %>%
+  left_join(prop_phylogroupe_df, by = c("membre2" = "group")) %>%
+  rename(p2 = proportion)
+
+# On calcule les proportions attendus p² et pi*pj (qu'on additionne entre doublons pour donner 2pi*pj)
+prop_theorique_df <- couples_df %>%
+  mutate(proportion_theorique = ifelse(membre1 == membre2, p1^2, p1 * p2)) %>%
+  dplyr::select(-p1,-p2)
+
+# Comme les couples précédents contiennent aussi les doublons on va merge tout ça
+prop_theorique_df <- prop_theorique_df %>%
+  rowwise() %>%
+  mutate(
+    # Créer une version triée des deux membres pour éviter les doublons
+    sorted_membres = paste(sort(c(membre1, membre2)), collapse = "-")
+  ) %>%
+  ungroup() %>%
+  group_by(sorted_membres) %>%
+  summarise(
+    proportion_theorique = sum(proportion_theorique), 
+    membre1 = strsplit(sorted_membres, "-")[[1]][1],
+    membre2 = strsplit(sorted_membres, "-")[[1]][2],
+    .groups = "drop"
+  ) %>%
+  dplyr::select(-sorted_membres)
+```
+
+Maintenant on va calculer les proportions observées de coportages.
+
+```{r prop_observ}
+# Fonction pour vérifier chevauchement entre deux intervalles
+check_overlap <- function(start1, end1, start2, end2) {
+  # Vérifie si les intervalles se chevauchent (y compris les cas où un intervalle est contenu dans l'autre)
+  return((start1 < end2 & end1 > start2) | (start2 < end1 & end2 > start1))
+}
+
+# Par comparaison entre les temps portés (donc dépendant de comment on les a calculé, ce qui crée un petit biais) on récupère les couples de souches (et leur phylogroupe qui est ce qui nous intéresse) coportés.
+co_portage <- longitudinal_strain %>%
+  filter(host != 40) %>%
+  group_by(host) %>%
+  summarise(paires = list({
+    df_host <- cur_data_all()  # <= prend juste le sous-dataframe de l’hôte courant
+    combn(1:nrow(df_host), 2, simplify = FALSE) %>%
+      map_df(~{
+        row1 <- df_host[.x[1], ]
+        row2 <- df_host[.x[2], ]
+        
+        if (row1$id.clone != row2$id.clone) {
+          overlap <- check_overlap(
+            row1$time_since_start, row1$time_max,
+            row2$time_since_start, row2$time_max
+          )
+          
+          if (overlap) {
+            tibble(
+              id1 = row1$id.clone,
+              id2 = row2$id.clone,
+              group1 = row1$group,
+              group2 = row2$group,
+              time1 = paste0("[", row1$time_since_start, ", ", row1$time_max, "]"),
+              time2 = paste0("[", row2$time_since_start, ", ", row2$time_max, "]")
+            )
+          } else {
+            NULL
+          }
+        } else {
+          NULL
+        }
+      })
+  }), .groups = "drop") %>%
+  unnest(paires) %>%
+  dplyr::select(group1,group2, host)
+
+# A cause de certains temps de résidence mal calculé (car on enlève et rajoute 7 alors qu'on devrait enlever et rajouter la moitié du temps moyen entre deux samples chez chaque hôte) on observe plus de co portage que ce qu'il y a réellement. J'espère que ca ne change pas trop les résultats.
+
+# On recalcule tous les couples possibles
+couples_df <- expand.grid(
+  membre1 = prop_phylogroupe_df$group,
+  membre2 = prop_phylogroupe_df$group,
+  stringsAsFactors = FALSE
+)
+
+# On calcule le nombre d'observations de chaque couples
+observed <- co_portage %>%
+  count(group1, group2, name = "n_obs")
+
+# On rajoute les couples qu'on a pas observés et on calcule les proportions observées dans la cohorte
+result <- couples_df %>%
+  left_join(observed, by = c("membre1" = "group1", "membre2" = "group2")) %>%
+  mutate(
+    n_obs = replace_na(n_obs, 0),
+    proportion = n_obs / sum(n_obs)
+  )
+
+# Result contient des couples en doublons, on va merge en additionnant les observations et donc les proportions
+result_clean <- result %>%
+  rowwise() %>%
+  mutate(
+    groupe1 = min(membre1, membre2),
+    groupe2 = max(membre1, membre2)
+  ) %>%
+  ungroup()
+result_merged <- result_clean %>%
+  group_by(groupe1, groupe2) %>%
+  summarise(
+    n_obs = sum(n_obs),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    proportion = n_obs / sum(n_obs)
+  ) %>%
+  dplyr::select(-n_obs)
+
+# On ajoute l'observation aux proportions théoriques
+prop_theo_vs_obs_df <- result_merged %>%
+  left_join(prop_theorique_df,  by = c("groupe1" = "membre1", "groupe2" = "membre2"))
+
+# On passe les deux proportions dans la même écriture
+prop_theo_vs_obs_df$proportion_theorique <- format(prop_theo_vs_obs_df$proportion_theorique, scientific = F)
+
+# Heatmap du combien de fois on observe en vrai divisé par le théorique (prédit par les distributions bootstrap et leur moyenne ou par la théorie) pour chaque couple de phylogroupe en rangeant chaque phylogroupe par temps moyen de résidence.
+
+# Isoler ceux en dessous de 1/665 pour les pas observés du tout
+```
+
+On observe quelques proportions théoriques qui ne fit pas avec les proportions de coportage observées. Par exemple : B2.3 et A.2 sont moins observés que prévus, de même pour B2.3 et D.1 ou A.2 et D.1. Ces trois couples de phylogroupes sont aussi ceux les plus majoritaires dans la population. Peut être que comme il y a plutôt un résident que plusieurs alors ces souches se font la guerre sur qui sera résident et donc on les observe peu en coportage.
+
+On va maintenant diviser l'observé par l'attendu (pour voir combien de fois plus on observe par rapport à ce qu'on prédit) et faire une heatmap en triant par ordre de phylogroupe le moins résident au plus résident.
+
+On va enlever tous les couples qui ont théoriquement moins d'une chance sur 665 (nombre de couples) d'être observé car il n'est normalement pas possible de les observer avec nos proportions. Ceci rend plus clean nos résultats.
+
+```{r heatmap_couples_}
+prop_theo_vs_obs_df <- prop_theo_vs_obs_df %>%
+  mutate(index_deviance =  log(as.numeric(proportion) / as.numeric(proportion_theorique))) %>%
+  mutate(index_deviance = if_else(proportion_theorique < 1/665, NA, index_deviance))
+
+# On s'assure que les colonnes groupe1 et groupe2 sont bien des facteurs avec les 12 niveaux
+groupes <- unique(c(prop_theo_vs_obs_df$groupe1, prop_theo_vs_obs_df$groupe2))
+prop_theo_vs_obs_df <- prop_theo_vs_obs_df %>%
+  mutate(
+    groupe1 = factor(groupe1, levels = groupes),
+    groupe2 = factor(groupe2, levels = groupes)
+  )
+
+# Pivot en matrice 12x12 avec index_deviance comme valeurs
+matrice_deviance <- prop_theo_vs_obs_df %>%
+  dplyr::select(groupe1, groupe2, index_deviance) %>%
+  pivot_wider(
+    names_from = groupe2,
+    values_from = index_deviance
+  ) %>%
+  column_to_rownames("groupe1") %>%
+  as.matrix()
+
+# Résultat
+matrice_deviance
+
+# Compléter la matrice symétrique
+matrice_sym <- matrice_deviance
+
+# Boucle pour remplir les NA avec les valeurs symétriques
+for (i in 1:nrow(matrice_sym)) {
+  for (j in 1:ncol(matrice_sym)) {
+    if (is.na(matrice_sym[i, j]) && !is.na(matrice_sym[j, i])) {
+      matrice_sym[i, j] <- matrice_sym[j, i]
+    }
+  }
+}
+
+matrice_sym
+
+temps_mean_res_phylogroupe <- longitudinal_strain %>%
+  group_by(group) %>%
+  summarise(mean_residency = mean(residency))
+
+ordre_groupes <- temps_mean_res_phylogroupe %>%
+  arrange(mean_residency) %>%
+  pull(group)
+
+# 2. Réordonner les lignes et colonnes de la matrice selon cet ordre
+matrice_ordonnee <- matrice_sym[ordre_groupes, ordre_groupes]
+
+library(reshape2)  # pour convertir la matrice en format long
+
+# Convertir la matrice en format long
+matrice_longue <- melt(matrice_ordonnee, varnames = c("Groupe1", "Groupe2"), value.name = "Index_deviance")
+
+# Créer la heatmap avec ggplot, avec une palette de couleurs distincte selon si la valeur est < 1 ou >= 1
+ggplot(matrice_longue, aes(x = Groupe1, y = Groupe2, fill = Index_deviance)) +
+  geom_tile() + 
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +  # Changer les couleurs autour de 1
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),  # Rotation des labels sur l'axe x
+        axis.text.y = element_text(angle = 45, hjust = 1)) +  # Rotation des labels sur l'axe y
+  labs(title = "Heatmap des Deviances entre Phylogroupes",
+       x = "Phylogroupes",
+       y = "Phylogroupes")
+```
+
+Mettre tout ce qui n'est pas très correct en NA empêche de bien voir ce qui se passe.
+
+```{r heatmap_couples, fig.height=7, fig.width=9}
+prop_theo_vs_obs_df <- prop_theo_vs_obs_df %>%
+  mutate(index_deviance =  log(as.numeric(proportion) / as.numeric(proportion_theorique))) %>%
+  mutate(index_deviance = if_else(proportion == 0, NA, index_deviance))
+
+# On s'assure que les colonnes groupe1 et groupe2 sont bien des facteurs avec les 12 niveaux
+groupes <- unique(c(prop_theo_vs_obs_df$groupe1, prop_theo_vs_obs_df$groupe2))
+prop_theo_vs_obs_df <- prop_theo_vs_obs_df %>%
+  mutate(
+    groupe1 = factor(groupe1, levels = groupes),
+    groupe2 = factor(groupe2, levels = groupes)
+  )
+
+# Pivot en matrice 12x12 avec index_deviance comme valeurs
+matrice_deviance <- prop_theo_vs_obs_df %>%
+  dplyr::select(groupe1, groupe2, index_deviance) %>%
+  pivot_wider(
+    names_from = groupe2,
+    values_from = index_deviance
+  ) %>%
+  column_to_rownames("groupe1") %>%
+  as.matrix()
+
+# Résultat
+matrice_deviance
+
+# Compléter la matrice symétrique
+matrice_sym <- matrice_deviance
+
+# Boucle pour remplir les NA avec les valeurs symétriques
+for (i in 1:nrow(matrice_sym)) {
+  for (j in 1:ncol(matrice_sym)) {
+    if (is.na(matrice_sym[i, j]) && !is.na(matrice_sym[j, i])) {
+      matrice_sym[i, j] <- matrice_sym[j, i]
+    }
+  }
+}
+
+temps_mean_res_phylogroupe <- longitudinal_strain %>%
+  group_by(group) %>%
+  summarise(mean_residency = mean(residency))
+
+ordre_groupes <- temps_mean_res_phylogroupe %>%
+  arrange(mean_residency) %>%
+  pull(group)
+
+# 2. Réordonner les lignes et colonnes de la matrice selon cet ordre
+matrice_ordonnee <- matrice_sym[ordre_groupes, ordre_groupes]
+
+library(reshape2)  # pour convertir la matrice en format long
+
+# Convertir la matrice en format long
+matrice_longue <- melt(matrice_ordonnee, varnames = c("Groupe1", "Groupe2"), value.name = "Index")
+
+# Créer la heatmap avec ggplot, avec une palette de couleurs distincte selon si la valeur est < 1 ou >= 1
+heatmap_coportage <- ggplot(matrice_longue, aes(x = Groupe1, y = Groupe2, fill = Index)) +
+  geom_tile() + 
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +  # Changer les couleurs autour de 1
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),  # Rotation des labels sur l'axe x
+        axis.text.y = element_text(angle = 45, hjust = 1)) +  # Rotation des labels sur l'axe y
+  labs(x = "Phylogroups",
+       y = "Phylogroups")
+
+heatmap_coportage
+
+ggsave(
+  filename = "heatmap.png",  # extension decides format
+  plot     = heatmap_coportage,                # which plot to save
+  width    = 9,                # in inches
+  height   = 7,
+  dpi      = 300               # resolution
+)
+```
+Les résidents sont A.2, B2.3, D.1 et F. Les transients sont les autres. 
+
+Un coportage entre deux transientes est une coinfection. 
+Un coportage entre transient et résident est soit une coinfection soit une coexistence passagère dans le microbiote.
+Un coportage entre deux résidentes est soit une coinfection soit une coexistence longue dans le microbiote (ou en tout cas un essai, en majorité).
+
+On observe que pour les couples de souches résidentes de différents phylogroupes on en observe moins que prévu par une association indépendante. Il y a donc une compétition entre les souches résidentes (première preuve assez forte d'une compétition entre phylogroupes de E. coli dans l'estomac). 
+
+On observe ensuite que pour les couples de souches résidentes du même phylogroupe on observe soit une association indépendante soit un effet bénéfique du coportage. 
+
+On observe un effet bénéfique du coportage entre les couples de souches transientes d'un même phylogroupe. Ceci montre que les coinfections entre deux souches d'un même phylogroupe sont fréquentes et positives pour les souches.
+
+On observe que pour les couples de transientes de phylogroupe différents on a soit des effets neutres soit positifs. L'association entre deux souches transientes n'est pas indépendante, elle semble facilitée car on l'observe plus que théoriquement.
+
+Certaines associations résidentes transientes semblent aussi facilitée. 
+
+On observe que le phylogroupe B2.3 est globalement associée négativement à tous les autres phylogroupes (sauf lui même) car on observe que les proportions observées de couples B2.3 - X sont plus faibles que celles prédites. Ceci pourrait faire penser à une espèce de toxicité des B2.3 envers les autres phylogroupes et donc pourrait expliquer pourquoi il augmente en prévalence ces dernières années.
+
+Testons si l'effet de B23 est negatif sur la diversité : 
+
+```{r}
+# 1. Calculer la diversité de chaque hôte
+df_diversity <- longitudinal_strain_host %>%
+  group_by(host) %>%
+  distinct(id.clone, .keep_all = TRUE) %>%
+  summarise(diversity = n())
+
+# 2. Identifier les hôtes ayant porté B2.3 plus de 14 jours
+b23_status <- longitudinal_strain_host %>%
+  filter(group == "B2.3") %>%
+  group_by(host) %>%
+  summarise(b23_presence = any(residency > 30))
+
+# 3. Joindre avec la diversité pour avoir tous les hôtes
+df_global_diversity_2 <- df_diversity %>%
+  left_join(b23_status, by = "host") %>%
+  mutate(b23_presence = ifelse(is.na(b23_presence), FALSE, b23_presence))
+
+ggplot(df_global_diversity_2, aes(x = b23_presence, y = diversity, fill = b23_presence)) +
+  geom_boxplot(alpha = 0.6, width = 0.5, outlier.shape = NA) +  # supprime les points automatiques
+  geom_jitter(aes(color = b23_presence), width = 0.2, size = 2, alpha = 0.8) +  # ajoute les points
+  scale_fill_manual(values = c("FALSE" = "#E69F00", "TRUE" = "#56B4E9"),
+                    labels = c("Non", "Oui")) +
+  scale_color_manual(values = c("FALSE" = "#E69F00", "TRUE" = "#56B4E9"), guide = "none") +
+  labs(
+    title = "Diversité clonale selon la présence prolongée de la souche B2.3 (>14j)",
+    x = "Présence prolongée de B2.3",
+    y = "Diversité clonale",
+    fill = "B2.3 > 14 jours"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(size = 12)
+  )
+```
+
+On voit une différence dans la diversité chez les gens ayant porté B2.3 pendant longtemps (si on prend plus que 14 jours l'écart se creuse).
+
+## Comparaison proportion de coportage observée et distribution simulée théorique A CREUSER ET REPRENDRE
+
+On peut aussi faire une approche par bootstrap, en calculant les distributions du nombre d'observations de chaque couple et en comparant à notre valeur obtenue. 
+
+Pour calculer les distributions du nombre d'observations on garde l'effet hôte-phylogroupe en resamplant chaque couple par hôte et en gardant les fréquences observées de chaque phylogroupe dans chaque sample (via replace = FALSE) ou on resamplent directement toutes les souches qui ont pu créer un couple dans la population (peut être plus proche de la façon dont on a calculé les proportions théoriques dans la partie précédente).
+
+```{r bootstrap_method, fig.height=30, fig.width=30}
+# Load ca si flemme de relance le bootstrap.
+load("mes_objets.RData") #bootstrap_df_host contient les proportions calculées avec prévalence dans chaque host, bootstrap_df_pop contient les proportions calculées avec prévalence dans la population des souches qui ont pu former un couple au moins une fois
+
+#CRTL + SHIFT + C pour tout commenter
+
+# n_bootstrap = 10000
+# 
+# bootstrap_df <- prop_theo_vs_obs_df %>%
+#   rename(proportion_observée = proportion)
+# 
+# # Tous les couples possibles
+# couples_df <- expand.grid(
+#   membre1 = prop_phylogroupe_df$group,
+#   membre2 = prop_phylogroupe_df$group,
+#   stringsAsFactors = FALSE
+# )
+# 
+# # Gérer ce problème de replace=T
+# for (i in 1:n_bootstrap) {
+#   pool <- c(co_portage$group1, co_portage$group2)
+# 
+#   # tirer aléatoirement sans remettre
+#   resample_groupes <- sample(pool, size = 2 * nrow(co_portage), replace = FALSE)
+# 
+#       # tirer aléatoirement en remettant -> on ne conserve pas les fréquences mais ca peut être          pertinent peut être
+#       #resample_groupes <- sample(pool, size = 2 * nrow(co_portage), replace = TRUE)
+# 
+#       # on recrée n() couples en piochant 2 vecteurs dans ce pool
+#   df_resample <- tibble(
+#       groupe1 = resample_groupes[1:nrow(co_portage)],
+#       groupe2 = resample_groupes[(nrow(co_portage) + 1):(2 * nrow(co_portage))]
+#     )
+# 
+#   #print(df_resample)
+# 
+#   #On calcule la proportion des chaque couple avec notre code plus haut
+#   observed <- df_resample %>%
+#   count(groupe1, groupe2, name = "n_obs")
+#   result <- couples_df %>%
+#     left_join(observed, by = c("membre1" = "groupe1", "membre2" = "groupe2")) %>%
+#     mutate(
+#       n_obs = replace_na(n_obs, 0),
+#       proportion = n_obs / sum(n_obs)
+#     )
+#   
+#   result_clean <- result %>%
+#     rowwise() %>%
+#     mutate(
+#       groupe1 = min(membre1, membre2),
+#       groupe2 = max(membre1, membre2)
+#     ) %>%
+#     ungroup()
+# 
+#   result_merged <- result_clean %>%
+#   group_by(groupe1, groupe2) %>%
+#   summarise(
+#     n_obs = sum(n_obs),
+#     .groups = "drop"
+#   ) %>%
+#   mutate(
+#     proportion = n_obs / sum(n_obs)
+#   ) %>%
+#   dplyr::select(-n_obs)
+# 
+#   #print(result_merged)
+# 
+#   # Renommer la colonne "proportion" en "proportion_i" où i est l'iteration
+#   result_merged <- result_merged %>%
+#     rename(!!paste0("proportion_", i) := proportion)
+# 
+#   # Joindre à bootstrap_df selon les colonnes groupe1 et groupe2
+#   bootstrap_df <- bootstrap_df %>%
+#     left_join(result_merged, by = c("groupe1", "groupe2"))
+# }
+
+# Faire choix entre bootstrap_df_host et bootstrap_df_pop
+
+df_long <- bootstrap_df_host %>%
+  mutate(
+    across(
+      starts_with("proportion_"),
+      # if your numbers are like “0,25” you may need:
+      # ~ as.numeric( stringr::str_replace(.x, ",", ".") )
+      as.numeric
+    )
+  ) %>%
+  pivot_longer(
+    cols      = starts_with("proportion_"),
+    names_to  = "iteration",
+    values_to = "proportion_value"
+  ) %>%
+  mutate(
+    bootstrap = ! iteration %in% c("proportion_observée", "proportion_theorique")
+  )
+
+df_bootstrap_only <- df_long %>%
+  filter(bootstrap)
+
+df_bootstrap_only <- df_bootstrap_only %>%
+  mutate(couple = paste(groupe1, groupe2, sep = "_"))
+
+df_long <- df_long %>%
+  mutate(couple = paste(groupe1, groupe2, sep = "_"))
+
+# Visualisation via histogrammes
+plot_geant_distrib_vs_observe_pop <- ggplot(df_bootstrap_only, aes(x = proportion_value)) +
+  geom_histogram(bins = 30, fill = "lightblue", color = "black") +
+  facet_wrap(~ couple, scales = "free") +
+  
+  # LIGNE ROUGE : proportion observée
+  geom_vline(
+    data = df_long %>% filter(!bootstrap, iteration == "proportion_observée"),
+    aes(xintercept = proportion_value, color = "Proportion observée"),
+    linetype = "dashed", size = 1
+  ) +
+
+  # LIGNE BLEUE : proportion théorique
+  geom_vline(
+    data = df_long %>% filter(!bootstrap, iteration == "proportion_theorique"),
+    aes(xintercept = proportion_value, color = "Proportion théorique"),
+    linetype = "dashed", size = 1
+  ) +
+
+  # Manually define colors
+  scale_color_manual(
+    name = "Référence",
+    values = c(
+      "Proportion observée" = "red",
+      "Proportion théorique" = "blue"
+    )
+  ) +
+
+  labs(
+    title = "Distribution des proportions bootstrap par couple de phylogroupes",
+    x = "Proportion bootstrap",
+    y = "Fréquence"
+  )
+
+ggsave(
+  filename = "distrib_observed.png",  # extension decides format
+  plot     = plot_geant_distrib_vs_observe_pop,                # which plot to save
+  width    = 20,                # in inches
+  height   = 20,
+  dpi      = 300               # resolution
+)
+
+plot_geant_distrib_vs_observe_pop
+```
+
+Pas de congruence entre la proportion théorique calculée (à partir de la proportion totale et en considérant tous les hôtes équivalents) et la distribution des proportions théorique calulée via chaque hôte, en même temps on ne les calcule pas du tout de la même manière. 
+
+Plus de congruence entre la proportion théorique calculée (à partir de la proportion totale et en considérant tous les hôtes équivalents) et la distribution des proportions théorique calulée via la prévalence des souches ayant formée un couple (dans toute la population), c'est normal c'est plus proche de comment on a calculée la proportion théorique de chaque couple en première instance.
+
+On observe qu'en fonction du couple les proportions de couples observées ne rentre pas du tout dans la distribution théorique de proportion sachant les souches qu'on a trouvé dans la cohorte.
+
+C'est par exemple le cas pour les couples de souches de même phylogroupe qui sont plus hautes qu'attendues (facilitation ?). Mais aussi les couples de souches de phylogroupes résidents différents qui ont des proportions observées plus faibles que la moyenne théorique prédite.
+
+Certains couples se forment de manière indépendante car les moyennes et la proportion observée coïncident. 
+
+# Courbes d'accumulation 
+
+Chaque hôte est un environnement et donc on peut faire des courbes d'accumulations à chaque sampling au niveau du phylogroupe.
+
+On s’intéresse ensuite à la vitesse de la pente et on essaiera d'inférer le nombre de samples à faire pour couvrir le plus de phylogroupes possibles.
+
+```{r accumulation, fig.height=40, fig.width=20}
+# On crée le df ordonné sur les host, date et samples
+longitudinal_ordered <- longitudinal %>%
+  arrange(host, date) %>%
+  group_by(host, date) %>%
+  mutate(sample_num = cur_group_id()) %>%
+  ungroup() %>%
+  group_by(host) %>%
+  mutate(num_sample = dense_rank(sample_num)) %>%
+  ungroup()
+
+# On met dans un df la fréquence cumulée de chaque phylogrupe différent
+phylo_cumul <- longitudinal_ordered %>%
+  group_by(host, num_sample) %>%
+  summarise(groupes_present = list(unique(group)), .groups = "drop") %>%
+  group_by(host) %>%
+  mutate(richesse_phylogroupe = accumulate(groupes_present, ~ union(.x, .y)) %>% map_int(length)) %>%
+  dplyr::select(host, num_sample, richesse_phylogroupe)
+
+# Pour ajouter le seuil où on a trouvé plus de 90% des phylogroupes de l'hote
+seuil_phylo_90 <- phylo_cumul %>%
+  group_by(host) %>%
+  mutate(
+    total_richesse = max(richesse_phylogroupe),  # La richesse totale
+    seuil_majorite_90 = total_richesse * 0.9     # On définit 90% du total
+  ) %>%
+  filter(richesse_phylogroupe >= seuil_majorite_90) %>%
+  slice_min(num_sample, with_ties = FALSE) %>%
+  dplyr::select(host, num_sample_majorite_90 = num_sample)
+
+# Beau Plot fait avec gpt
+accumulation_plot <- ggplot(phylo_cumul, aes(x = as.factor(num_sample), y = richesse_phylogroupe)) +
+  geom_line(aes(group = host), size = 1.2, color = "#0072B2") +  # Courbe continue en bleu
+  geom_point(aes(color = as.factor(host)), size = 3, show.legend = FALSE) +  # Points sans légende
+  geom_vline(data = seuil_phylo_90, 
+             aes(xintercept = as.factor(num_sample_majorite_90), group = host),
+             linetype = "dashed", color = "red", linewidth = 1.2) +  # Ligne pointillée rouge au seuil des 90%
+  facet_wrap(~ host, scales = "free_y", ncol = 2) +  # Facettes par hôte avec échelle libre en Y
+  scale_x_discrete(name = "Numéro de l'échantillon", 
+                   breaks = seq(1, max(phylo_cumul$num_sample), by = 1)) +  # X discret
+  scale_y_continuous(name = "Richesse cumulative") +  # Y continu
+  labs(
+    title = "Courbe d'accumulation des phylogroupes avec seuil de 90%"
+  ) + 
+  theme_minimal(base_size = 16) +  # Police plus grande
+  theme(
+    strip.text = element_text(face = "bold", size = 14, color = "black"),  # Titre des facettes
+    axis.title = element_text(size = 14, face = "bold"),  # Taille et style des titres des axes
+    axis.text = element_text(size = 12, color = "black"),  # Taille des ticks
+    plot.title = element_text(size = 18, face = "bold", color = "#0072B2", hjust = 0.5),  # Titre du plot
+    plot.subtitle = element_text(size = 14, color = "#D55E00", hjust = 0.5),  # Sous-titre
+    plot.caption = element_text(size = 10, color = "gray60", hjust = 1),  # Légende en bas à droite
+    panel.grid.major = element_line(color = "gray90", size = 0.5),  # Grille légère
+    panel.grid.minor = element_line(color = "gray95", size = 0.25),  # Grille plus fine
+    legend.position = "none"  # Suppression de la légende
+  )
+
+accumulation_plot
+```
+
+Aucun hôte ne semble sur un plateau. On va merge toutes ces courbes pour déceller une tendance. On pourrait peut être calculer des métriques sur ces courbes et les expliquer avec les facteurs hôtes.
+
+```{r, fig.height=7, fig.width=9}
+# Plot combiné
+combined_plot <- ggplot(phylo_cumul, aes(x = num_sample, y = richesse_phylogroupe, group = host)) +
+  # Toutes les lignes semi-transparentes
+  geom_line(size = 1.2, color = "#0072B2", alpha = 0.3) +
+  # (Optionnel) Points si besoin
+  # geom_point(size = 2, color = "#0072B2", alpha = 0.3) +
+  # Courbe de tendance globale (moyenne lissée)
+  geom_smooth(aes(group = 1), method = "loess", se = FALSE, color = "#D55E00", size = 1) +
+  scale_x_continuous(breaks = seq(1, max(phylo_cumul$num_sample), by = 1),
+                     name = "Number of sample") +
+  scale_y_continuous(name = "Cumulative phylogroup richness") +
+  labs(
+    title = "Accumulation plot of phylogroups"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title    = element_text(size = 18, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 14, hjust = 0.5),
+    plot.caption  = element_text(size = 10, hjust = 1, color = "gray60"),
+    axis.title    = element_text(size = 14, face = "bold"),
+    axis.text     = element_text(size = 12),
+    panel.grid    = element_line(color = "gray90")
+  )
+
+# Affichage
+print(combined_plot)
+
+ggsave(
+  filename = "accumulation.png",  # extension decides format
+  plot     = combined_plot,                # which plot to save
+  width    = 9,                # in inches
+  height   = 7,
+  dpi      = 300               # resolution
+)
+```
+
+# Sauvegarde variables
+
+```{r}
+# Je save les objets pour qu'ils soient dispo plus tard
+save(summary_combined,summary_table_preval,permanova_model,plot_geant_distrib_vs_observe_pop, heatmap_coportage, accumulation_plot, combined_plot, file = "cohort_ecology.RData")
+```

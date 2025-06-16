@@ -1,0 +1,373 @@
+---
+title: "cohort"
+author: "Jules Baldous"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = F, error = TRUE)
+rm(list = ls())
+load(file = "metadata.RData")
+```
+
+Alt + O pour replier tout et ouvrir que ce qui est pertinent.
+
+**Package nécessaires à l'exécution de ce document :**
+
+```{r package}
+library(dplyr)
+library(gtsummary)
+library(GGally)
+library(ggplot2)
+library(FactoMineR)
+library(factoextra)
+library(plotly)
+library(corrplot)
+library(scales)
+library(psych)
+library(pheatmap)
+library(pvclust)
+library(ggpmisc)
+library(ggbeeswarm)
+library(MASS)
+library(car)
+library(tidyr)
+```
+
+# Importation 
+
+```{r importation}
+longitudinal_complete <-read.csv("~/Documents/recherche/Stage_M1/eve/data/eve_prelim.csv")
+```
+
+# Traitement de la cohorte : ajout des descripteurs
+
+On va traiter un peu les données et virer les lignes qui ne servent à rien. 
+
+`longitudinal` est le jeu de données comportant le suivi des souches de E. coli dans le temps chez chaque hôte. Chaque ligne correspond à un évènement de sample d'une souche bactérienne.
+
+```{r traitement_1}
+longitudinal <- longitudinal_complete %>%
+  # Garder uniquement les souches d'E. coli
+  filter(species == 'Escherichia coli') %>%
+  # Supprimer les lignes entièrement vides
+  filter(rowSums(is.na(.)) < ncol(.)) %>%
+  # Convertir en facteur les colonnes 1:4 et 7 si elles sont numériques
+  mutate(across(c(1:4, 7), ~ if (is.numeric(.x)) factor(.x) else .x)) %>%
+  # Convertir la colonne date en Date
+  mutate(date = as.Date(date))
+```
+
+On va maintenant ajouter les descripteurs de notre cohorte. Pour cela on crée un dataframe `longitudinal_strain` où chaque ligne est une souche avec ses caractéristiques. Si une souche est observée plusieurs fois chez un hôte elle ne fait qu'une ligne. Avec les différents temps de samples on peut passer de `longitudinal_strain` à `longitudinal` sans soucis.
+
+Premièrement le temps de résidence de chaque souche.
+
+## Ajout du temps de résidence
+
+Pour cela 3 hypothèses : 
+
+- Le `id_clone` est basé sur l'hypothèse que si on observe un clone (MLVA) chez un hôte à différent temps, c'est le même clone (hypothèse basée sur le fait qu'il est hautement improbable pour un hôte d'être réinfecté par exactement la même souche).
+
+- On considère que si on observe une souche alors c'est qu'elle est là depuis au moins 7 jours (sample tous les deux semaines) et qu'elle est là encore 7 jours après la dernière observation (hypothèse pour parez au samplage discret toutes les 2 semaines). 
+
+- On fait aussi l'hypothèse que si on observe une première fois la souche et qu'on la réobserve (quelque soit le temps de sample après) on considère qu'elle a toujours été là mais pas en quantité assez grosse pour être samplée (hypothèse basé sur le fait qu'on ait seulement 5 sample).
+
+On va ajouter divers informations sur la résidence : le temps de résidence de chaque souche (dans `residency`), le statut de résident ou pas (on considère qu'une souche est résidente si son temps de résidence est au moins de 30 jours, dans `resident_status`). 
+
+```{r residency,fig.height=45, fig.width=10}
+# De base j'avais fait deux boucles for imbriquées mais GPT me l'a optimisé comme suit:
+longitudinal_summary <- longitudinal %>%
+  group_by(host, id.clone) %>%
+  summarise(
+    date_min = min(date),
+    date_max = max(date),
+    dates_samples = list(as.Date(date)),
+    
+    residency = 14 + as.numeric(date_max - date_min),
+    .groups = "drop"
+  )
+
+# On peut maintenant modifier le dataframe pour faire en sorte que chaque ligne soit une souche unique chez un hôte, avant ça on moyenne la densité globale et focale par souche puisqu'on ne garde qu'un évènement de sample pour une souche. 
+
+longitudinal <- longitudinal %>%
+  group_by(host, id.clone) %>%
+  mutate(density = mean(density),
+         dens.self = mean(dens.self)) %>%
+  mutate(log.density = log(density),
+         log.dens.self = log(dens.self))
+
+longitudinal_strain <- longitudinal[!duplicated(longitudinal[,c("host", "id.clone")]), ]
+
+# On lie les deux df pour avoir longitudinal_strain clean
+longitudinal_strain <- longitudinal_strain %>%
+  left_join(longitudinal_summary, by = c("host", "id.clone"))
+
+# On enlève les variables qui ne servent plus du df
+longitudinal_strain$id.sample = NULL
+longitudinal_strain$species = NULL
+longitudinal_strain$date <- NULL
+
+# Hypothèse 2
+longitudinal_strain$date_min <- longitudinal_strain$date_min - 7
+longitudinal_strain$date_max <- longitudinal_strain$date_max + 7 
+
+#Ajoute une colonne résident ou pas : En fonction de la définition les facteurs hôtes changent. Pour 30 le nbr foyer n'est plus significatif dans le glm
+longitudinal_strain$resident_status = longitudinal_strain$residency > 15
+```
+
+# Visualisation de la cohorte
+
+Visualisons rapidement les éléments du dataset `longitudinal_strain`
+
+```{r visualisation_1}
+table_sum_cohort <- tbl_summary(dplyr::select(longitudinal_strain, log.density, log.dens.self, group, host, residency, resident_status), by = group)
+
+table_sum_cohort
+```
+
+On observe que les valeurs de densité totale (combien de bactéries dans les 5 samples) sont assez variables en fonction des hôtes. On voit aussi qu'en moyenne la densité de chaque souches est proche de la densité totale, ceci indique chez chaque hôte un sample est présent en grande quantité, c'est la souche résidente. 
+
+On voit aussi une diversité des différents phylogroupes chez chaque hôte mais aussi entre les hôtes (qui ne partagent pas du tout les mêmes phylogroupes).
+
+On voit que chaque hôte possède quelques souches résidentes pendant la cohorte et beaucoup de souches transientes. Ceci rejoint les schémas déjà observés par d'autres études.
+
+Le temps de résidence en lui même varie entre les hôtes, ceci va nous permettre de l'expliquer avec les facteurs de metadata par la suite.
+
+Nous allons maintenant effectuer quelques visualisations pour aider à la compréhension et creuser les premières intuitions.
+
+Voyons premièrement à quelle date s'est déroulée la cohorte.
+
+```{r date, include=F}
+dates_num <- as.numeric(longitudinal$date)
+
+bin <- 15  # nombre de jours pour l'agrégation, on sample toutes les 2 semaines
+
+tick_interval <- bin * 4  # un tick tous les 2 mois
+
+ggplot(longitudinal, aes(x = date)) +
+  geom_histogram(binwidth = bin, colour = "white", fill = "steelblue") +
+  scale_x_date(
+    breaks = seq(min(longitudinal$date), max(longitudinal$date), by = paste(tick_interval, "days")),
+    labels = date_format("%Y-%b"),
+    limits = c(min(longitudinal$date), max(longitudinal$date))
+  ) +
+  theme_bw() +
+  xlab(NULL)
+```
+
+La cohorte s'est principalement déroulée sur l'année 2022. Quelques hôtes ont commencé l'année d'avant. Enfaîte, le boom correspond à l'appel en Novembre qui a été fait auprès de la communauté étudiante de l'université de Bichat.
+
+## Visualisation de la cohorte : résidence des souches
+
+Ensuite représentons `longitudinal_strain` au niveau du phylogroupe et au niveau des souches. Pour cela il faut faire quelques arrangements techniques du dataframe. Par exemple on ne veut pas que l'axe soit des dates absolus car la cohorte s'étale sur des temps différents en fonction de chaque hôte (on prend donc un axe de temps relatif au premier sampling de chaque hôte).
+
+```{r visualisation_cohorte, fig.height=45, fig.width=10}
+# Code en partie fait avec ChatGPT pour faire de beaux graphiques rapidement
+
+# On stock sur différentes lignes les occurrences de sampling d'une souche (pour geom_point)
+longitudinal_points <- longitudinal_strain %>%
+  unnest(dates_samples)
+
+# On ajoute au à ce df la date de chaque sample selon l'échelle de l'axe x
+longitudinal_points <- longitudinal_points %>% 
+  group_by(host) %>%
+  mutate(dates_samples_2 = as.numeric(difftime(dates_samples, min(date_min), units = "days")))
+
+# On ajoute le temps de début et de fin sur l'échelle prise par l'axe x
+longitudinal_strain <- longitudinal_strain %>%
+  group_by(host) %>%
+  mutate(time_since_start = as.numeric(difftime(date_min, min(date_min), units = "days")),
+         time_max = time_since_start + residency)
+
+# On trie les lignes (par hôte) pour avoir un graphique plus lisible
+longitudinal_strain <- longitudinal_strain %>%
+  group_by(host) %>%
+  mutate(id.clone = factor(id.clone, levels = id.clone[order(date_min)]))
+
+# Représentons la cohorte au niveau du phylogroupe
+plot_cohort_phylogroup <- ggplot(longitudinal_strain, aes(x = time_since_start, xend = time_max, y = id.clone, yend = id.clone, colour = group)) + 
+  facet_grid(
+    rows = vars(host), 
+    scales = "free_y", 
+    space = "free_y", 
+    labeller = labeller(host = function(value) paste0("Host ", value))  # Custom labeller for host
+  ) +
+  geom_segment(size = 1.2) + 
+  xlab("Time") + 
+  geom_point(data = longitudinal_points, aes(x = dates_samples_2, y = id.clone), 
+             colour = "black", size = 2, inherit.aes = FALSE) + 
+  ylab("Clone ID") +
+  theme_bw() +
+  scale_color_hue() +  # Automatic color scale
+  labs(colour = "Phylogroups") +  # Rename the legend
+  scale_x_continuous(limits = c(0, 150)) +  # Set x-axis limits
+  theme(
+    legend.position = "top",  # Move legend to the top
+    legend.direction = "horizontal",  # Make legend horizontal
+    legend.box = "horizontal",  # Ensure legend items are in a single row
+    text = element_text(size = 10),  # General text size
+    axis.text = element_text(size = 6),  # Axis text size
+    strip.text = element_text(size = 4),  # Facet label text size
+    panel.spacing = unit(1, "lines")  # Adjust spacing between facets
+  ) +
+  guides(colour = guide_legend(
+    nrow = 1,  # Force legend into a single row
+    override.aes = list(shape = 22, size = 4, fill = "white")  # Use boxes for legend keys
+  ))
+
+plot_cohort_phylogroup
+
+# Représentons la cohorte au niveau du clone
+plot_cohort_strain <- ggplot(longitudinal_strain, aes(x = time_since_start, xend = time_max, y = id.clone, yend = id.clone, colour = resident_status)) + 
+  facet_grid(
+    rows = vars(host), 
+    scales = "free_y", 
+    space = "free_y", 
+    labeller = labeller(host = function(value) paste0("Host ", value))  # Custom labeller for host
+  ) +
+  geom_segment(size = 1.2) + 
+  xlab("Time") + 
+  geom_point(data = longitudinal_points, aes(x = dates_samples_2, y = id.clone), 
+             colour = "black", size = 2, inherit.aes = FALSE) + 
+  ylab("Clone ID") +
+  theme_bw() +
+  scale_color_hue() +  # Automatic color scale
+  labs(colour = "Souches Résidentes") +  # Rename the legend
+  scale_x_continuous(limits = c(0, 150)) +  # Set x-axis limits
+  theme(
+    legend.position = "top",  # Move legend to the top
+    legend.direction = "horizontal",  # Make legend horizontal
+    legend.box = "horizontal",  # Ensure legend items are in a single row
+    text = element_text(size = 10),  # General text size
+    axis.text = element_text(size = 6),  # Axis text size
+    strip.text = element_text(size = 4),  # Facet label text size
+    panel.spacing = unit(1, "lines")  # Adjust spacing between facets
+  ) +
+  guides(colour = guide_legend(
+    nrow = 1,  # Force legend into a single row
+    override.aes = list(shape = 22, size = 4, fill = "white")  # Use boxes for legend keys
+  ))
+
+plot_cohort_strain
+```
+
+# Essai d'amélioration du plot cohorte
+
+```{r cohorte_complete, fig.height=45, fig.width=10}
+# On ajoute les traitements
+time_since_start <- rep(0, nrow(antibiotique))
+
+antibiotique <- antibiotique %>%
+  mutate(record_id = as.character(record_id))
+longitudinal_strain <- longitudinal_strain %>%
+  mutate(host = as.character(host))
+
+antibiotique$time_since_start <- time_since_start
+
+debut_host <- longitudinal_strain %>%
+  group_by(host) %>%
+  summarise(date_debut = min(date_min, na.rm = TRUE))
+
+for(i in seq_len(nrow(antibiotique))){
+  treatment <- antibiotique$date_traitement[i]
+  host_focal <- as.character(antibiotique$record_id[i])
+  
+  # Récupérer la date de début correspondant à host_focal
+  date_debut <- debut_host$date_debut[debut_host$host == host_focal]
+  
+  # Calculer la différence en jours
+  time <- max(0,as.numeric(difftime(treatment, date_debut, units = "days")))
+  
+  # Affecter le résultat à la colonne time_since_start pour la ligne i
+  antibiotique$time_since_start[i] <- time
+}
+
+# On ajoute les voyages :
+
+# On ajoute les traitements
+time_since_start <- rep(0, nrow(voyage))
+
+voyage <- voyage %>%
+  mutate(record_id = as.character(record_id))
+
+voyage$time_since_start <- time_since_start
+
+for(i in seq_len(nrow(voyage))){
+  v <- voyage$date_voyage[i]
+  host_focal <- as.character(voyage$record_id[i])
+  
+  # Récupérer la date de début correspondant à host_focal
+  date_debut <- debut_host$date_debut[debut_host$host == host_focal]
+  
+  # Calculer la différence en jours
+  time <- max(0,as.numeric(difftime(v, date_debut, units = "days")))
+  
+  # Affecter le résultat à la colonne time_since_start pour la ligne i
+  voyage$time_since_start[i] <- time
+}
+
+longitudinal_strain$host <- factor(longitudinal_strain$host, 
+                                   levels = sort(as.numeric(unique(longitudinal_strain$host))))
+
+antibiotique$host <- factor(antibiotique$record_id, 
+                            levels = sort(as.numeric(unique(antibiotique$record_id))))
+
+voyage$host <- factor(voyage$record_id, 
+                            levels = sort(as.numeric(unique(voyage$record_id))))
+
+plot_cohort_phylogroup_2 <- ggplot(longitudinal_strain, aes(x = time_since_start, xend = time_max, y = id.clone, yend = id.clone, colour = group)) + 
+  facet_grid(
+    rows = vars(host), 
+    scales = "free_y", 
+    space = "free_y", 
+    labeller = labeller(host = function(value) paste0("Host ", value))  # Custom labeller for host
+  ) +
+  geom_segment(size = 1.2) + 
+  xlab("Time") + 
+  geom_point(data = longitudinal_points, aes(x = dates_samples_2, y = id.clone), 
+             colour = "black", size = 2, inherit.aes = FALSE) +
+  geom_point(data = antibiotique[antibiotique$time_since_start != 0,], 
+             mapping = aes(x = time_since_start, y = 0.5, group = host),  # ajustez y selon ce qui convient pour chaque host
+             colour = "red", shape = 17, size = 3, inherit.aes = FALSE) +
+  geom_point(data = voyage[voyage$time_since_start != 0,], 
+             mapping = aes(x = time_since_start, y = 1, group = host),  # ajustez y selon ce qui convient pour chaque host
+             colour = "blue", shape = 16, size = 2, inherit.aes = FALSE) +
+  ylab("Clone ID") +
+  theme_bw() +
+  scale_color_hue() +  # Automatic color scale
+  labs(colour = "Phylogroupes") +  # Rename the legend
+  scale_x_continuous(limits = c(0, 150)) +  # Set x-axis limits
+  theme(
+    legend.position = "top",  # Move legend to the top
+    legend.direction = "horizontal",  # Make legend horizontal
+    legend.box = "horizontal",  # Ensure legend items are in a single row
+    text = element_text(size = 10),  # General text size
+    axis.text = element_text(size = 6),  # Axis text size
+    strip.text = element_text(size = 4),  # Facet label text size
+    panel.spacing = unit(1, "lines")  # Adjust spacing between facets
+  ) +
+  guides(colour = guide_legend(
+    nrow = 1,  # Force legend into a single row
+    override.aes = list(shape = 22, size = 4, fill = "white")  # Use boxes for legend keys
+  ))
+```
+
+# Temps de résidence en fonction du phylogroupe 
+
+```{r residency_phylogroupe}
+ggplot(na.omit(longitudinal_strain), aes(x = group, y = residency, fill = group)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(aes(x = group), shape = ".", size=1) +
+    theme(legend.position = "none") + 
+    ggtitle("Résidence et Phylogroupe")
+```
+
+# Sauvegarde variables
+
+Comme ceci est un child document on a pas envie de s'encombrer avec des variables inutiles.
+
+```{r}
+# Je save les objets pour qu'ils soient dispo plus tard
+save(longitudinal_complete, longitudinal_strain, plot_cohort_phylogroup, plot_cohort_phylogroup_2, plot_cohort_strain, table_sum_cohort, longitudinal, file = "cohort.RData")
+```
